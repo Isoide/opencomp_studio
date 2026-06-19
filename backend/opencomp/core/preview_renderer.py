@@ -1,0 +1,506 @@
+from __future__ import annotations
+
+import hashlib
+import math
+import time
+from dataclasses import dataclass
+
+import numpy as np
+
+from opencomp.core.evaluator import FloatPreviewCacheEntry, GraphEvaluator
+from opencomp.core.models import ProjectGraph, ProjectSettings
+from opencomp.io.cryptomatte import (
+    build_cryptomatte_matte,
+    cryptomatte_id_preview_rgba,
+    cryptomatte_preview_rgba,
+)
+from opencomp.io.preview import encode_preview_png, preview_rgba_for_channel, resize_float_rgba
+
+
+@dataclass(frozen=True, slots=True)
+class PreviewRequest:
+    cache_node_id: str
+    eval_node_id: str
+    frame: int
+    display: str | None = None
+    view: str | None = None
+    channel: str | None = "rgba"
+    max_width: int | None = None
+    max_height: int | None = None
+    ocio_config: str | None = None
+    output_signature: str | None = None
+    viewer_process: ViewerProcess | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ViewerProcess:
+    gain: float = 1.0
+    saturation: float = 1.0
+    fstop: float = 0.0
+
+
+def render_standard_preview(evaluator: GraphEvaluator, graph: ProjectGraph, request: PreviewRequest) -> bytes:
+    node = graph.nodes[request.cache_node_id]
+    request_started = time.perf_counter()
+    process = _normalized_viewer_process(request.viewer_process)
+    cache_channel = _processed_channel_key(request.channel, process)
+    preview_key = _preview_key(evaluator, graph, request, cache_channel)
+    cached_preview = evaluator.get_cached_preview(preview_key)
+    if cached_preview is not None:
+        evaluator.mark_node_cache_hit(request.cache_node_id, node.type)
+        evaluator.record_phase_timing(
+            request.cache_node_id,
+            "viewer.preview_cache",
+            0.0,
+            {"frame": request.frame, "channel": request.channel or "rgba", "hit": True, "bytes": len(cached_preview)},
+        )
+        evaluator.record_preview_timing(
+            request.cache_node_id,
+            {
+                "cache_hit": True,
+                "total_ms": round((time.perf_counter() - request_started) * 1000.0, 2),
+                "evaluate_ms": 0.0,
+                "resize_ms": 0.0,
+                "ocio_ms": 0.0,
+                "encode_ms": 0.0,
+                "channel": request.channel or "rgba",
+                "viewer_process": _viewer_process_payload(process),
+                "float_cache_hit": True,
+                "bytes": len(cached_preview),
+            },
+        )
+        return cached_preview
+
+    float_preview, float_hit, evaluate_ms, resize_ms = get_float_preview(evaluator, graph, request)
+    evaluator.record_phase_timing(
+        request.cache_node_id,
+        "viewer.float_cache",
+        evaluate_ms + resize_ms,
+        {
+            "frame": request.frame,
+            "channel": request.channel or "rgba",
+            "hit": float_hit,
+            "evaluate_ms": round(evaluate_ms, 2),
+            "resize_ms": round(resize_ms, 2),
+        },
+    )
+    with evaluator.node_runtime(request.cache_node_id, node.type):
+        process_started = time.perf_counter()
+        processed_rgba = apply_viewer_process(float_preview.rgba, process)
+        process_ms = (time.perf_counter() - process_started) * 1000.0
+        evaluator.record_phase_timing(
+            request.cache_node_id,
+            "viewer.process",
+            process_ms,
+            {"gain": process.gain, "saturation": process.saturation, "fstop": process.fstop},
+        )
+        ocio_started = time.perf_counter()
+        display_rgba = (
+            evaluator.ocio.apply_display_view(processed_rgba, float_preview.colorspace, request.display, request.view)
+            if float_preview.apply_ocio
+            else processed_rgba
+        )
+        ocio_ms = (time.perf_counter() - ocio_started) * 1000.0
+        evaluator.record_phase_timing(
+            request.cache_node_id,
+            "viewer.ocio_display",
+            ocio_ms,
+            {
+                "colorspace": float_preview.colorspace,
+                "display": request.display,
+                "view": request.view,
+                "applied": float_preview.apply_ocio,
+            },
+        )
+        encode_started = time.perf_counter()
+        png_bytes = encode_preview_png(display_rgba)
+        encode_ms = (time.perf_counter() - encode_started) * 1000.0
+        evaluator.record_phase_timing(
+            request.cache_node_id,
+            "viewer.png_encode",
+            encode_ms,
+            {"width": int(display_rgba.shape[1]), "height": int(display_rgba.shape[0]), "bytes": len(png_bytes)},
+        )
+
+    evaluator.store_cached_preview(preview_key, png_bytes)
+    evaluator.record_preview_timing(
+        request.cache_node_id,
+        {
+            "cache_hit": False,
+            "total_ms": round((time.perf_counter() - request_started) * 1000.0, 2),
+            "evaluate_ms": round(evaluate_ms, 2),
+            "resize_ms": round(resize_ms, 2),
+            "viewer_process_ms": round(process_ms, 2),
+            "ocio_ms": round(ocio_ms, 2),
+            "encode_ms": round(encode_ms, 2),
+            "source_width": float_preview.source_width,
+            "source_height": float_preview.source_height,
+            "pixel_aspect": float_preview.pixel_aspect,
+            "channel": request.channel or "rgba",
+            "viewer_process": _viewer_process_payload(process),
+            "float_cache_hit": float_hit,
+            "preview_width": int(display_rgba.shape[1]),
+            "preview_height": int(display_rgba.shape[0]),
+            "bytes": len(png_bytes),
+        },
+    )
+    return png_bytes
+
+
+def render_difference_preview(
+    evaluator: GraphEvaluator,
+    graph: ProjectGraph,
+    request_a: PreviewRequest,
+    request_b: PreviewRequest,
+) -> bytes:
+    node = graph.nodes[request_a.cache_node_id]
+    request_started = time.perf_counter()
+    process = _normalized_viewer_process(request_a.viewer_process)
+    output_signature = _combined_signature(
+        request_a.output_signature or evaluator.output_signature(graph, request_a.cache_node_id, request_a.frame),
+        request_b.output_signature or evaluator.output_signature(graph, request_b.cache_node_id, request_b.frame),
+    )
+    preview_key = evaluator.preview_cache_key_for_signature(
+        request_a.cache_node_id,
+        request_a.frame,
+        output_signature,
+        request_a.display,
+        request_a.view,
+        f"difference:{request_a.channel or 'rgba'}:{_viewer_process_key(process)}",
+        request_a.max_width,
+        request_a.max_height,
+        request_a.ocio_config,
+    )
+    cached_preview = evaluator.get_cached_preview(preview_key)
+    if cached_preview is not None:
+        evaluator.mark_node_cache_hit(request_a.cache_node_id, node.type)
+        evaluator.record_phase_timing(
+            request_a.cache_node_id,
+            "viewer.preview_cache",
+            0.0,
+            {"frame": request_a.frame, "channel": request_a.channel or "rgba", "hit": True, "mode": "difference"},
+        )
+        evaluator.record_preview_timing(request_a.cache_node_id, _cached_timing("difference", len(cached_preview)))
+        return cached_preview
+
+    float_a, hit_a, eval_a_ms, resize_a_ms = get_float_preview(evaluator, graph, request_a)
+    float_b, hit_b, eval_b_ms, resize_b_ms = get_float_preview(evaluator, graph, request_b)
+    evaluator.record_phase_timing(
+        request_a.cache_node_id,
+        "viewer.float_cache",
+        eval_a_ms + eval_b_ms + resize_a_ms + resize_b_ms,
+        {
+            "frame": request_a.frame,
+            "channel": request_a.channel or "rgba",
+            "hit": hit_a and hit_b,
+            "mode": "difference",
+            "evaluate_ms": round(eval_a_ms + eval_b_ms, 2),
+            "resize_ms": round(resize_a_ms + resize_b_ms, 2),
+        },
+    )
+    with evaluator.node_runtime(request_a.cache_node_id, node.type):
+        process_started = time.perf_counter()
+        processed_a = apply_viewer_process(float_a.rgba, process)
+        processed_b = apply_viewer_process(float_b.rgba, process)
+        height = min(processed_a.shape[0], processed_b.shape[0])
+        width = min(processed_a.shape[1], processed_b.shape[1])
+        difference = np.abs(processed_a[:height, :width] - processed_b[:height, :width]).astype(np.float32, copy=False)
+        difference[:, :, 3] = 1.0
+        process_ms = (time.perf_counter() - process_started) * 1000.0
+        evaluator.record_phase_timing(
+            request_a.cache_node_id,
+            "viewer.process",
+            process_ms,
+            {"mode": "difference", "gain": process.gain, "saturation": process.saturation, "fstop": process.fstop},
+        )
+        ocio_started = time.perf_counter()
+        display_rgba = (
+            evaluator.ocio.apply_display_view(difference, float_a.colorspace, request_a.display, request_a.view)
+            if float_a.apply_ocio
+            else difference
+        )
+        ocio_ms = (time.perf_counter() - ocio_started) * 1000.0
+        evaluator.record_phase_timing(
+            request_a.cache_node_id,
+            "viewer.ocio_display",
+            ocio_ms,
+            {"mode": "difference", "colorspace": float_a.colorspace, "display": request_a.display, "view": request_a.view},
+        )
+        encode_started = time.perf_counter()
+        png_bytes = encode_preview_png(display_rgba)
+        encode_ms = (time.perf_counter() - encode_started) * 1000.0
+        evaluator.record_phase_timing(
+            request_a.cache_node_id,
+            "viewer.png_encode",
+            encode_ms,
+            {"mode": "difference", "width": int(display_rgba.shape[1]), "height": int(display_rgba.shape[0]), "bytes": len(png_bytes)},
+        )
+
+    evaluator.store_cached_preview(preview_key, png_bytes)
+    evaluator.record_preview_timing(
+        request_a.cache_node_id,
+        {
+            "cache_hit": False,
+            "total_ms": round((time.perf_counter() - request_started) * 1000.0, 2),
+            "evaluate_ms": round(eval_a_ms + eval_b_ms, 2),
+            "resize_ms": round(resize_a_ms + resize_b_ms, 2),
+            "viewer_process_ms": round(process_ms, 2),
+            "ocio_ms": round(ocio_ms, 2),
+            "encode_ms": round(encode_ms, 2),
+            "channel": request_a.channel or "rgba",
+            "compare_mode": "difference",
+            "viewer_process": _viewer_process_payload(process),
+            "float_cache_hit": hit_a and hit_b,
+            "preview_width": int(display_rgba.shape[1]),
+            "preview_height": int(display_rgba.shape[0]),
+            "bytes": len(png_bytes),
+        },
+    )
+    return png_bytes
+
+
+def get_float_preview(
+    evaluator: GraphEvaluator,
+    graph: ProjectGraph,
+    request: PreviewRequest,
+) -> tuple[FloatPreviewCacheEntry, bool, float, float]:
+    output_signature = request.output_signature or evaluator.output_signature(graph, request.cache_node_id, request.frame)
+    cache_key = evaluator.float_preview_cache_key_for_signature(
+        request.cache_node_id,
+        request.frame,
+        output_signature,
+        request.channel,
+        request.max_width,
+        request.max_height,
+    )
+    cached = evaluator.get_cached_float_preview(cache_key)
+    if cached is not None:
+        return cached, True, 0.0, 0.0
+
+    evaluate_started = time.perf_counter()
+    image = evaluator.evaluate_node(graph, request.eval_node_id, request.frame)
+    evaluate_ms = (time.perf_counter() - evaluate_started) * 1000.0
+    resize_started = time.perf_counter()
+    source_rgba, apply_ocio = preview_rgba_for_channel(image, request.channel)
+    preview_rgba = resize_float_rgba(source_rgba, max_width=request.max_width, max_height=request.max_height)
+    resize_ms = (time.perf_counter() - resize_started) * 1000.0
+    entry = FloatPreviewCacheEntry(
+        rgba=np.ascontiguousarray(preview_rgba, dtype=np.float32),
+        apply_ocio=apply_ocio,
+        colorspace=image.colorspace,
+        source_width=image.width,
+        source_height=image.height,
+        pixel_aspect=image.pixel_aspect,
+        format_bbox=dict(image.format_bbox or {}),
+        data_window=dict(image.data_window or {}),
+        bytes=int(preview_rgba.nbytes),
+    )
+    evaluator.store_cached_float_preview(cache_key, entry)
+    return entry, False, evaluate_ms, resize_ms
+
+
+def apply_viewer_process(rgba: np.ndarray, process: ViewerProcess) -> np.ndarray:
+    image = np.asarray(rgba, dtype=np.float32)
+    result = np.nan_to_num(image.copy(), nan=0.0, posinf=65504.0, neginf=-65504.0)
+    exposure = float(2.0 ** process.fstop) * process.gain
+    rgb = result[:, :, :3] * exposure
+    if process.saturation != 1.0:
+        luma = rgb[:, :, 0:1] * 0.2126 + rgb[:, :, 1:2] * 0.7152 + rgb[:, :, 2:3] * 0.0722
+        rgb = luma + (rgb - luma) * process.saturation
+    result[:, :, :3] = rgb
+    return np.ascontiguousarray(result.astype(np.float32, copy=False))
+
+
+def warm_viewer_input_previews(
+    evaluator: GraphEvaluator,
+    graph: ProjectGraph,
+    viewer_id: str,
+    frame: int,
+    display: str | None,
+    view: str | None,
+    channel: str | None,
+    max_width: int | None,
+    max_height: int | None,
+    ocio_config: str | None,
+    viewer_process: ViewerProcess | None = None,
+    input_sockets: set[str] | None = None,
+) -> None:
+    viewer = graph.nodes.get(viewer_id)
+    if viewer is None or viewer.type.lower() != "viewer":
+        return
+
+    warmed_signatures: set[str] = set()
+    for edge in graph.incoming_edges(viewer_id):
+        if input_sockets is not None and edge.target_socket not in input_sockets:
+            continue
+        if edge.source_node not in graph.nodes:
+            continue
+        try:
+            output_signature = evaluator.node_signature(graph, edge.source_node, frame)
+            if output_signature in warmed_signatures:
+                continue
+            warmed_signatures.add(output_signature)
+            request = PreviewRequest(
+                cache_node_id=viewer_id,
+                eval_node_id=edge.source_node,
+                frame=frame,
+                display=display,
+                view=view,
+                channel=channel,
+                max_width=max_width,
+                max_height=max_height,
+                ocio_config=ocio_config,
+                output_signature=output_signature,
+                viewer_process=viewer_process,
+            )
+            if evaluator.has_cached_preview(_preview_key(evaluator, graph, request, _processed_channel_key(channel, _normalized_viewer_process(viewer_process)))):
+                continue
+            render_standard_preview(evaluator, graph, request)
+        except Exception:
+            continue
+
+
+def render_cryptomatte_preview(
+    evaluator: GraphEvaluator,
+    graph: ProjectGraph,
+    node_id: str,
+    frame: int,
+    layer: str | None,
+    matte_ids: list[str],
+    max_width: int | None,
+    max_height: int | None,
+    settings: ProjectSettings,
+) -> bytes:
+    cache_channel = (
+        f"cryptomatte:{layer or ''}:{','.join(sorted(matte_ids))}"
+        if matte_ids
+        else f"cryptomatte:{layer or ''}:id-preview"
+    )
+    request_started = time.perf_counter()
+    preview_key = evaluator.preview_cache_key(
+        graph,
+        node_id,
+        frame,
+        None,
+        None,
+        cache_channel,
+        max_width,
+        max_height,
+        settings.ocio_config,
+    )
+    cached_preview = evaluator.get_cached_preview(preview_key)
+    if cached_preview is not None:
+        evaluator.mark_node_cache_hit(node_id, graph.nodes[node_id].type)
+        evaluator.record_preview_timing(node_id, _cached_timing(cache_channel, len(cached_preview)))
+        return cached_preview
+
+    evaluate_started = time.perf_counter()
+    image = evaluator.evaluate_node(graph, node_id, frame)
+    evaluate_ms = (time.perf_counter() - evaluate_started) * 1000.0
+    preview_started = time.perf_counter()
+    if matte_ids:
+        preview_rgba = cryptomatte_preview_rgba(build_cryptomatte_matte(image, layer, matte_ids, settings))
+    else:
+        preview_rgba = cryptomatte_id_preview_rgba(image, layer, settings)
+    preview_ms = (time.perf_counter() - preview_started) * 1000.0
+    resize_started = time.perf_counter()
+    proxy = resize_float_rgba(preview_rgba, max_width=max_width, max_height=max_height)
+    resize_ms = (time.perf_counter() - resize_started) * 1000.0
+    encode_started = time.perf_counter()
+    png_bytes = encode_preview_png(proxy)
+    encode_ms = (time.perf_counter() - encode_started) * 1000.0
+
+    evaluator.store_cached_preview(preview_key, png_bytes)
+    evaluator.record_preview_timing(
+        node_id,
+        {
+            "cache_hit": False,
+            "total_ms": round((time.perf_counter() - request_started) * 1000.0, 2),
+            "evaluate_ms": round(evaluate_ms, 2),
+            "preview_ms": round(preview_ms, 2),
+            "resize_ms": round(resize_ms, 2),
+            "ocio_ms": 0.0,
+            "encode_ms": round(encode_ms, 2),
+            "channel": cache_channel,
+            "preview_width": int(proxy.shape[1]),
+            "preview_height": int(proxy.shape[0]),
+            "bytes": len(png_bytes),
+        },
+    )
+    return png_bytes
+
+
+def _preview_key(
+    evaluator: GraphEvaluator,
+    graph: ProjectGraph,
+    request: PreviewRequest,
+    cache_channel: str | None = None,
+):
+    if request.output_signature is not None:
+        return evaluator.preview_cache_key_for_signature(
+            request.cache_node_id,
+            request.frame,
+            request.output_signature,
+            request.display,
+            request.view,
+            cache_channel or request.channel,
+            request.max_width,
+            request.max_height,
+            request.ocio_config,
+        )
+    return evaluator.preview_cache_key(
+        graph,
+        request.cache_node_id,
+        request.frame,
+        request.display,
+        request.view,
+        cache_channel or request.channel,
+        request.max_width,
+        request.max_height,
+        request.ocio_config,
+    )
+
+
+def _cached_timing(channel: str, byte_count: int) -> dict:
+    return {
+        "cache_hit": True,
+        "total_ms": 0.0,
+        "evaluate_ms": 0.0,
+        "resize_ms": 0.0,
+        "ocio_ms": 0.0,
+        "encode_ms": 0.0,
+        "channel": channel,
+        "bytes": byte_count,
+    }
+
+
+def _normalized_viewer_process(process: ViewerProcess | None) -> ViewerProcess:
+    process = process or ViewerProcess()
+    gain = _finite_or_default(process.gain, 1.0)
+    saturation = _finite_or_default(process.saturation, 1.0)
+    fstop = _finite_or_default(process.fstop, 0.0)
+    return ViewerProcess(gain=max(gain, 0.0), saturation=max(saturation, 0.0), fstop=fstop)
+
+
+def _finite_or_default(value: float, default: float) -> float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return default
+    return numeric if math.isfinite(numeric) else default
+
+
+def _viewer_process_key(process: ViewerProcess) -> str:
+    return f"g={process.gain:.6g};s={process.saturation:.6g};f={process.fstop:.6g}"
+
+
+def _viewer_process_payload(process: ViewerProcess) -> dict[str, float]:
+    return {"gain": process.gain, "saturation": process.saturation, "fstop": process.fstop}
+
+
+def _processed_channel_key(channel: str | None, process: ViewerProcess) -> str:
+    return f"{channel or 'rgba'}|vp:{_viewer_process_key(process)}"
+
+
+def _combined_signature(a: str, b: str) -> str:
+    return hashlib.sha1(f"{a}|{b}".encode("utf-8")).hexdigest()

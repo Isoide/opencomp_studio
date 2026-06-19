@@ -1,0 +1,59 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Callable, Protocol
+
+from opencomp.color.ocio_engine import OCIOColorEngine
+from opencomp.core.models import ImageFrame, Node, ProjectSettings
+
+
+@dataclass(slots=True)
+class EvaluationContext:
+    frame: int
+    settings: ProjectSettings
+    ocio: OCIOColorEngine
+    metrics: Callable[[str, str, float, dict[str, Any] | None], None] | None = None
+
+    def record_metric(
+        self,
+        node_id: str,
+        phase: str,
+        duration_ms: float,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        if self.metrics is not None:
+            self.metrics(node_id, phase, duration_ms, details)
+
+
+class NodeOperation(Protocol):
+    def evaluate(
+        self,
+        node: Node,
+        inputs: dict[str, ImageFrame],
+        context: EvaluationContext,
+    ) -> ImageFrame:
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class NodeDefinition:
+    type: str
+    label: str
+    category: str
+    operation: NodeOperation
+    inputs: tuple[str, ...] = ()
+    outputs: tuple[str, ...] = ("out",)
+
+
+class NodeEvaluationError(RuntimeError):
+    def __init__(self, node_id: str, message: str) -> None:
+        super().__init__(f"{node_id}: {message}")
+        self.node_id = node_id
+        self.message = message
+
+
+def require_input(node: Node, inputs: dict[str, ImageFrame], socket: str = "in") -> ImageFrame:
+    image = inputs.get(socket) or next(iter(inputs.values()), None)
+    if image is None:
+        raise NodeEvaluationError(node.id, f"Node '{node.type}' requires an input image.")
+    return image
