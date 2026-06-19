@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Introduction - OpenComp Studio</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <header class="topbar">
+        <div class="brand">OpenComp Studio Docs</div>
+        <nav class="nav" aria-label="Documentation">
+          <a href="index.html">Home</a>
+          <a class="active" href="introduction.html">Introduction</a>
+          <a href="nodes.html">Nodes</a>
+          <a href="architecture.html">Architecture</a>
+          <a href="api.html">API</a>
+          <a href="cli.html">CLI</a>
+        </nav>
+      </header>
+
+      <main>
+        <section class="hero">
+          <div>
+            <div class="eyebrow">Introduction</div>
+            <h1>A Nuke-like compositor foundation in the browser</h1>
+            <p>
+              OpenComp Studio currently combines a React canvas UI with a FastAPI image
+              processing backend. The goal is to make node-based compositing, OCIO viewing,
+              EXR metadata, scripting, and caching available in a local web app.
+            </p>
+          </div>
+          <div class="screenshot">
+            <img src="../assets/opencomp-main-ui.png" alt="OpenComp Studio interface" />
+          </div>
+        </section>
+
+        <section class="section">
+          <h2>Main Panels</h2>
+          <div class="grid">
+            <div class="card"><strong>Node Menu</strong><p>Categorized node list for I/O, color, channel, merge, transform, metadata, and output nodes.</p></div>
+            <div class="card"><strong>Viewer</strong><p>Canvas viewer with display/view/channel controls, proxy/full-res, pixel readout, compare tools, and playback.</p></div>
+            <div class="card"><strong>Graph</strong><p>Canvas node graph with top-to-bottom flow and detachable connections.</p></div>
+            <div class="card"><strong>Inspector</strong><p>Node properties, root settings, metrics, and log views.</p></div>
+            <div class="card"><strong>Script Editor</strong><p>Runs Python-like scripts against the backend session to create and modify graphs.</p></div>
+            <div class="card"><strong>Preferences</strong><p>Project-level cache, hotkey, proxy, tile, and startup customization settings.</p></div>
+          </div>
+        </section>
+
+        <section class="section">
+          <h2>Typical Flow</h2>
+          <div class="flow">
+            <div><strong>1. Read</strong><br />Load plate or render sequences.</div>
+            <div><strong>2. Process</strong><br />Grade, reformat, shuffle, merge.</div>
+            <div><strong>3. View</strong><br />Connect to Viewer numbered inputs.</div>
+            <div><strong>4. Cache</strong><br />Scrub or play while caches warm.</div>
+            <div><strong>5. Write</strong><br />Render through a Write node.</div>
+          </div>
+        </section>
+
+        <section class="section">
+          <h2>Current State</h2>
+          <div class="grid two">
+            <div class="card">
+              <strong>Ready for prototype slapcomps</strong>
+              <p>Read multiple EXR sequences, merge them, apply basic color transforms, preview through OCIO, and write EXR output.</p>
+            </div>
+            <div class="card">
+              <strong>Still a v1 engine</strong>
+              <p>Graph processing is CPU-based, caches are in-memory, and true visible-region tile rendering is a future step.</p>
+            </div>
+          </div>
+        </section>
+      </main>
+      <footer class="footer">See the Markdown companion: ../INTRODUCTION.md</footer>
+    </div>
+  </body>
+</html>

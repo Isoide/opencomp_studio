@@ -214,6 +214,19 @@ class SaveProjectRequest(BaseModel):
     project: Project | None = None
 
 
+class LoadProjectRequest(BaseModel):
+    path: str
+
+
+class ImportProjectRequest(BaseModel):
+    project: Project
+
+
+class ExportNukeRequest(BaseModel):
+    path: str | None = None
+    project: Project | None = None
+
+
 class PythonScriptRequest(BaseModel):
     code: str
 

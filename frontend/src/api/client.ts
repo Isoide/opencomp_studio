@@ -427,13 +427,11 @@ function websocketBinary(path: string, payload: unknown, signal: AbortSignal | u
     socket.onmessage = (event) => {
       if (typeof event.data === "string") {
         finish(() => {
-          socket.close();
           reject(new Error(event.data));
         });
         return;
       }
       finish(() => {
-        socket.close();
         if (event.data instanceof Blob) {
           resolve(event.data);
         } else {
@@ -499,7 +497,6 @@ function websocketFloatFrame(
         const parsed = JSON.parse(event.data);
         if (parsed.type === "error") {
           finish(() => {
-            socket.close();
             reject(new Error(parsed.detail ?? event.data));
           });
           return;
@@ -532,7 +529,6 @@ function websocketFloatFrame(
           };
           const resolvedPixels = tiledPixels;
           finish(() => {
-            socket.close();
             resolve({ header: resolvedHeader, pixels: resolvedPixels });
           });
           return;
@@ -598,7 +594,6 @@ function websocketFloatFrame(
       }
       const resolvedHeader = header;
       finish(() => {
-        socket.close();
         resolve({ header: resolvedHeader, pixels: pixelsFromBuffer(resolvedHeader.dtype, buffer) });
       });
     };
@@ -626,6 +621,32 @@ export const client = {
       method: "POST",
       body: JSON.stringify({ path, project }),
     }),
+  loadProject: (path: string) =>
+    jsonRequest<Project>("/api/projects/load", {
+      method: "POST",
+      body: JSON.stringify({ path }),
+    }),
+  importProject: (project: Project) =>
+    jsonRequest<Project>("/api/projects/import", {
+      method: "POST",
+      body: JSON.stringify({ project }),
+    }),
+  exportNuke: (path: string | null, project: Project) =>
+    jsonRequest<{ status: string; path: string; message: string }>("/api/projects/export-nuke", {
+      method: "POST",
+      body: JSON.stringify({ path, project }),
+    }),
+  exportNukeContent: async (path: string | null, project: Project): Promise<Blob> => {
+    const response = await fetch(`${API_BASE}/api/projects/export-nuke/content`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path, project }),
+    });
+    if (!response.ok) {
+      throw new Error(await response.text());
+    }
+    return response.blob();
+  },
   getGraph: () => jsonRequest<ProjectGraph>("/api/graph"),
   putGraph: (graph: ProjectGraph) =>
     jsonRequest<ProjectGraph>("/api/graph", { method: "PUT", body: JSON.stringify({ graph }) }),
@@ -789,9 +810,9 @@ export const client = {
       viewerFloatWebSocketSupported = true;
       return data;
     } catch (error) {
-      if (!isAbortError(error)) {
-        viewerFloatWebSocketSupported = false;
-      }
+      // Backend restarts and transient socket closes should not permanently
+      // disable the GPU viewer path for the whole app session.
+      viewerFloatWebSocketSupported = true;
       throw error;
     }
   },

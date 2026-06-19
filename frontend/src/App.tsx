@@ -1,5 +1,5 @@
-import { Cable, FolderOpen, Play, Plus, Save, Search, X } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Cable, Download, FolderOpen, Play, Plus, Save, Search, Upload, X } from "lucide-react";
+import { type ChangeEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
   client,
@@ -82,6 +82,19 @@ type FrontendViewerCacheState = {
   misses: number;
   evictions: number;
 };
+type FileSystemWritableFileStreamLike = {
+  write: (data: Blob) => Promise<void>;
+  close: () => Promise<void>;
+};
+type FileSystemFileHandleLike = {
+  createWritable: () => Promise<FileSystemWritableFileStreamLike>;
+};
+type WindowWithSavePicker = Window & {
+  showSaveFilePicker?: (options: {
+    suggestedName?: string;
+    types?: Array<{ description: string; accept: Record<string, string[]> }>;
+  }) => Promise<FileSystemFileHandleLike>;
+};
 
 export default function App() {
   const {
@@ -160,6 +173,7 @@ export default function App() {
   const [showViewerPanel, setShowViewerPanel] = useState(true);
 
   const abortRef = useRef<AbortController | null>(null);
+  const openProjectInputRef = useRef<HTMLInputElement | null>(null);
   const nodePaletteInputRef = useRef<HTMLInputElement | null>(null);
   const lastSyncedSettingsRef = useRef("");
   const lastSyncedGraphRef = useRef("");
@@ -1101,20 +1115,145 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [addLog, addNode, deleteSelectedNode, lastGraphPosition, project?.preferences.hotkeys, refreshViewer, setViewerInput]);
 
-  async function saveProject() {
+  async function saveProject(pathOverride?: string | null) {
     const current = latestRef.current;
     if (!current.project || !current.graph) return;
-    const projectToSave = { ...current.project, graph: current.graph };
+    if (pathOverride === undefined && !current.project.settings.project_path) {
+      await saveProjectToBrowserFile(undefined, true);
+      return;
+    }
+    const targetPath =
+      pathOverride === undefined
+        ? current.project.settings.project_path
+        : pathOverride;
+    if (!targetPath) {
+      addLog("info", "Save cancelled.");
+      return;
+    }
+    if (!isBackendFilesystemPath(targetPath)) {
+      await saveProjectToBrowserFile(targetPath, false);
+      return;
+    }
     try {
       await syncGraphAndSettings();
-      const saved = await client.saveProject(current.project.settings.project_path, projectToSave);
+      const refreshed = latestRef.current;
+      if (!refreshed.project || !refreshed.graph) return;
+      const projectToSave = projectWithCurrentGraph(refreshed.project, refreshed.graph);
+      const saved = await client.saveProject(targetPath, projectToSave);
       setProject(saved);
-      addLog(
-        "info",
-        current.project.settings.project_path
-          ? `Project saved to ${current.project.settings.project_path}.`
-          : "Project synced; set a script path to write a JSON file.",
-      );
+      addLog("info", `Project saved to ${saved.settings.project_path ?? targetPath}.`);
+    } catch (error) {
+      addLog("error", error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function saveProjectAs() {
+    const current = latestRef.current;
+    if (!current.project) return;
+    const suggested = current.project.settings.project_path ?? `${current.project.project_name || "opencomp_project"}.opencomp`;
+    const path = window.prompt("Full backend path, or filename for browser download", suggested);
+    if (!path) {
+      addLog("info", "Save As cancelled.");
+      return;
+    }
+    await saveProject(path);
+  }
+
+  async function saveProjectToBrowserFile(filename?: string | null, preferPicker = false) {
+    const current = latestRef.current;
+    if (!current.project || !current.graph) return;
+    const fileName = ensureOpenCompExtension(filename || suggestedProjectFilename(current.project));
+    const projectToSave = projectWithCurrentGraph(current.project, current.graph, true);
+    const blob = new Blob([JSON.stringify(projectToSave, null, 2)], { type: "application/json" });
+    const saved = await saveBlobWithBrowser(blob, fileName, "OpenComp project", "application/json", [".opencomp"], preferPicker);
+    if (saved.kind === "cancelled") {
+      addLog("info", "Browser save cancelled.");
+      return;
+    }
+    addLog("info", saved.kind === "picker" ? `Saved browser file ${fileName}.` : `Downloaded ${fileName}.`);
+  }
+
+  function openProjectFromBrowser() {
+    openProjectInputRef.current?.click();
+  }
+
+  async function importOpenCompFile(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    try {
+      const parsed = JSON.parse(await file.text()) as Project;
+      const imported = await client.importProject({
+        ...parsed,
+        settings: { ...parsed.settings, project_path: null },
+      });
+      await adoptLoadedProject(imported, `Imported ${file.name}.`);
+    } catch (error) {
+      addLog("error", error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function loadProjectFromPath() {
+    const path = window.prompt("Open OpenComp script from backend path", project?.settings.project_path ?? "");
+    if (!path) {
+      addLog("info", "Open cancelled.");
+      return;
+    }
+    try {
+      const loaded = await client.loadProject(path);
+      await adoptLoadedProject(loaded, `Loaded ${loaded.settings.project_path ?? path}.`);
+    } catch (error) {
+      addLog("error", error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function adoptLoadedProject(loaded: Project, message: string) {
+    cancelIdlePrefetch();
+    const config = await loadColorConfig();
+    const settings = {
+      ...loaded.settings,
+      viewer_display: loaded.settings.viewer_display ?? config.default_display,
+      viewer_view: loaded.settings.viewer_view ?? config.default_view,
+    };
+    if (JSON.stringify(settings) !== JSON.stringify(loaded.settings)) {
+      await client.putProjectSettings(settings);
+    }
+    clearFrontendViewerCache(frontendViewerCacheRef.current);
+    setCachedFrames([]);
+    setSelectedMetadata(null);
+    setViewerMetadata(null);
+    setProject({ ...loaded, settings });
+    await loadCacheStatus();
+    addLog("info", message);
+  }
+
+  async function exportNukeScript() {
+    const current = latestRef.current;
+    if (!current.project || !current.graph) return;
+    try {
+      await syncGraphAndSettings();
+      const refreshed = latestRef.current;
+      if (!refreshed.project || !refreshed.graph) return;
+      const projectToExport = projectWithCurrentGraph(refreshed.project, refreshed.graph);
+      const suggested = suggestedNukeFilename(projectToExport);
+      const path = window.prompt("Full backend path, or filename for browser .nk export", suggested);
+      if (!path) {
+        addLog("info", "Nuke export cancelled.");
+        return;
+      }
+      const target = ensureNukeExtension(path);
+      if (isBackendFilesystemPath(target)) {
+        const result = await client.exportNuke(target, projectToExport);
+        addLog("info", `${result.message} ${result.path}`);
+        return;
+      }
+      const blob = await client.exportNukeContent(target, projectToExport);
+      const saved = await saveBlobWithBrowser(blob, target, "Nuke script", "text/plain", [".nk"], true);
+      if (saved.kind === "cancelled") {
+        addLog("info", "Nuke export cancelled.");
+        return;
+      }
+      addLog("info", saved.kind === "picker" ? `Exported ${target}.` : `Downloaded ${target}.`);
     } catch (error) {
       addLog("error", error instanceof Error ? error.message : String(error));
     }
@@ -1279,13 +1418,34 @@ export default function App() {
           <span>OpenComp Studio</span>
         </div>
         <button onClick={() => void createNewProject()}>
-          <FolderOpen size={16} />
+          <Plus size={16} />
           New
+        </button>
+        <button onClick={() => openProjectFromBrowser()}>
+          <Upload size={16} />
+          Open File
+        </button>
+        <input
+          ref={openProjectInputRef}
+          type="file"
+          accept=".opencomp,application/json"
+          onChange={(event) => void importOpenCompFile(event)}
+          hidden
+        />
+        <button onClick={() => void loadProjectFromPath()}>
+          <FolderOpen size={16} />
+          Open Path
         </button>
         <button onClick={() => void saveProject()}>
           <Save size={16} />
           Save
         </button>
+        <button onClick={() => void saveProjectAs()}>Save As</button>
+        <button onClick={() => void saveProjectToBrowserFile(undefined, true)}>
+          <Download size={16} />
+          Download
+        </button>
+        <button onClick={() => void exportNukeScript()}>Export .nk</button>
         <button onClick={() => void refreshViewer()}>
           <Play size={16} />
           View
@@ -1719,6 +1879,89 @@ function frontendCacheFrameContext(
     channel: snapshot.viewerChannel,
     proxy: proxyCacheToken(snapshot.project),
   };
+}
+
+function projectWithCurrentGraph(project: Project, graph: ProjectGraph, clearProjectPath = false): Project {
+  const activeScriptId = project.active_script_id || project.script_tabs[0]?.id || "main";
+  const scriptTabs =
+    project.script_tabs.length > 0
+      ? project.script_tabs.map((tab) => (tab.id === activeScriptId ? { ...tab, graph } : tab))
+      : [{ id: activeScriptId, name: "Comp 1", graph, path: null, startup_scripts: [], kind: "comp" }];
+  return {
+    ...project,
+    active_script_id: activeScriptId,
+    graph,
+    script_tabs: scriptTabs,
+    settings: {
+      ...project.settings,
+      project_path: clearProjectPath ? null : project.settings.project_path,
+    },
+  };
+}
+
+function isBackendFilesystemPath(path: string) {
+  const value = path.trim();
+  return /^[A-Za-z]:[\\/]/.test(value) || value.startsWith("\\\\") || value.startsWith("/") || value.includes("/") || value.includes("\\");
+}
+
+function suggestedProjectFilename(project: Project) {
+  return ensureOpenCompExtension((project.project_name || "opencomp_project").replace(/[^A-Za-z0-9_.-]+/g, "_"));
+}
+
+function ensureOpenCompExtension(filename: string) {
+  const trimmed = filename.trim() || "opencomp_project.opencomp";
+  return trimmed.toLowerCase().endsWith(".opencomp") ? trimmed : `${trimmed}.opencomp`;
+}
+
+function suggestedNukeFilename(project: Project) {
+  const fromPath = project.settings.project_path?.replace(/\.opencomp$/i, ".nk");
+  if (fromPath) return fromPath;
+  return ensureNukeExtension((project.project_name || "opencomp_project").replace(/[^A-Za-z0-9_.-]+/g, "_"));
+}
+
+function ensureNukeExtension(filename: string) {
+  const trimmed = filename.trim() || "opencomp_project.nk";
+  return trimmed.toLowerCase().endsWith(".nk") ? trimmed : `${trimmed}.nk`;
+}
+
+async function saveBlobWithBrowser(
+  blob: Blob,
+  filename: string,
+  description: string,
+  mimeType: string,
+  extensions: string[],
+  preferPicker: boolean,
+): Promise<{ kind: "picker" | "download" | "cancelled" }> {
+  const savePicker = (window as WindowWithSavePicker).showSaveFilePicker;
+  if (preferPicker && savePicker) {
+    try {
+      const handle = await savePicker({
+        suggestedName: filename,
+        types: [{ description, accept: { [mimeType]: extensions } }],
+      });
+      const writable = await handle.createWritable();
+      await writable.write(blob);
+      await writable.close();
+      return { kind: "picker" };
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") {
+        return { kind: "cancelled" };
+      }
+    }
+  }
+  downloadBlob(blob, filename);
+  return { kind: "download" };
+}
+
+function downloadBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 function proxyCacheToken(project: Project) {

@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>OpenComp Studio Documentation</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <header class="topbar">
+        <div class="brand">OpenComp Studio Docs</div>
+        <nav class="nav" aria-label="Documentation">
+          <a class="active" href="index.html">Home</a>
+          <a href="introduction.html">Introduction</a>
+          <a href="nodes.html">Nodes</a>
+          <a href="architecture.html">Architecture</a>
+          <a href="api.html">API</a>
+          <a href="cli.html">CLI</a>
+        </nav>
+      </header>
+
+      <main>
+        <section class="hero">
+          <div>
+            <div class="eyebrow">Local node-based compositor prototype</div>
+            <h1>OpenComp Studio</h1>
+            <p>
+              A browser UI and Python backend for EXR/ACES/OCIO compositing workflows,
+              with a Nuke-like node graph, GPU-assisted viewer, Python script editor,
+              and in-memory render/cache engine.
+            </p>
+            <div class="taglist">
+              <span class="tag">FastAPI</span>
+              <span class="tag">NumPy</span>
+              <span class="tag">OpenEXR</span>
+              <span class="tag">OpenColorIO</span>
+              <span class="tag">React</span>
+              <span class="tag">WebGL2</span>
+            </div>
+          </div>
+          <div class="screenshot">
+            <img src="../assets/opencomp-main-ui.png" alt="OpenComp Studio main UI" />
+          </div>
+        </section>
+
+        <section class="section">
+          <h2>Read First</h2>
+          <div class="grid">
+            <a class="card" href="introduction.html">
+              <strong>1. Introduction</strong>
+              <p>What the app is, current workflow, UI structure, and feature state.</p>
+            </a>
+            <a class="card" href="nodes.html">
+              <strong>2. Nodes</strong>
+              <p>Node catalog, graph model, evaluation contract, and how to add nodes.</p>
+            </a>
+            <a class="card" href="architecture.html">
+              <strong>3. Architecture</strong>
+              <p>Image processing, I/O, OCIO, caching, threading, WebGL viewer, and limits.</p>
+            </a>
+            <a class="card" href="cli.html">
+              <strong>4. CLI</strong>
+              <p>Headless `.opencomp` scripts, Python automation, metadata inspection, and Write-node renders.</p>
+            </a>
+          </div>
+        </section>
+
+        <section class="section">
+          <h2>Processing Overview</h2>
+          <div class="flow">
+            <div><strong>Read</strong><br />EXR/PNG/JPG to float RGBA and metadata.</div>
+            <div><strong>Evaluate</strong><br />Demand-driven backend graph traversal.</div>
+            <div><strong>Cache</strong><br />Node frames, float previews, final previews.</div>
+            <div><strong>Stream</strong><br />Float16 tiles or PNG fallback.</div>
+            <div><strong>Display</strong><br />WebGL viewer process plus OCIO shader.</div>
+          </div>
+        </section>
+
+        <section class="section">
+          <h2>Current Performance Notes</h2>
+          <div class="grid">
+            <div class="card stat">
+              <span class="value">float16 tiles</span>
+              <p>Default GPU viewer transport over WebSocket.</p>
+            </div>
+            <div class="card stat">
+              <span class="value">10 GB</span>
+              <p>Default frontend viewer cache target, capped at 64 GB.</p>
+            </div>
+            <div class="card stat">
+              <span class="value">CPU graph</span>
+              <p>Node processing is currently NumPy/Pillow/OpenEXR on CPU.</p>
+            </div>
+          </div>
+        </section>
+      </main>
+
+      <footer class="footer">OpenComp Studio documentation generated from the current codebase.</footer>
+    </div>
+  </body>
+</html>

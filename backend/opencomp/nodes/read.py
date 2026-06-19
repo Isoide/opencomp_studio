@@ -20,18 +20,27 @@ class ReadNode:
     ) -> ImageFrame:
         path = str(node.params.get("path") or node.params.get("file") or "builtin://gradient")
         colorspace = str(node.params.get("colorspace") or context.settings.working_colorspace)
+        read_channels = _read_channels(node)
         read_frame = _mapped_frame(node, context.frame)
         read_frame = _range_frame(node, read_frame)
         if read_frame is None:
             return _black_frame(node, context)
         try:
             started = time.perf_counter()
-            image = read_image(path, frame=read_frame, colorspace=colorspace)
+            image = read_image(path, frame=read_frame, colorspace=colorspace, read_channels=read_channels)
             context.record_metric(
                 node.id,
                 "read.image",
                 (time.perf_counter() - started) * 1000.0,
-                {"path": path, "frame": read_frame, "colorspace": colorspace, "width": image.width, "height": image.height},
+                {
+                    "path": path,
+                    "frame": read_frame,
+                    "colorspace": colorspace,
+                    "width": image.width,
+                    "height": image.height,
+                    "read_channels": "all" if read_channels is None else read_channels,
+                    "loaded_channel_groups": len(image.channel_data),
+                },
             )
             return image
         except Exception as exc:
@@ -43,7 +52,7 @@ class ReadNode:
                 if nearest is not None:
                     try:
                         started = time.perf_counter()
-                        image = read_image(path, frame=nearest, colorspace=colorspace)
+                        image = read_image(path, frame=nearest, colorspace=colorspace, read_channels=read_channels)
                         context.record_metric(
                             node.id,
                             "read.image",
@@ -55,6 +64,8 @@ class ReadNode:
                                 "colorspace": colorspace,
                                 "width": image.width,
                                 "height": image.height,
+                                "read_channels": "all" if read_channels is None else read_channels,
+                                "loaded_channel_groups": len(image.channel_data),
                             },
                         )
                         return image
@@ -123,6 +134,22 @@ def _black_frame(node: Node, context: EvaluationContext) -> ImageFrame:
         frame=context.frame,
         metadata={"read/missing": "black", "input/frame": context.frame},
     )
+
+
+def _read_channels(node: Node) -> list[str] | None:
+    read_all = node.params.get("read_all_channels", node.params.get("load_all_channels", True))
+    if isinstance(read_all, str):
+        read_all = read_all.strip().lower() not in {"0", "false", "no", "off"}
+    if bool(read_all):
+        return None
+    value = node.params.get("read_channels", node.params.get("channels_to_load"))
+    if value is None or value == "":
+        return ["RGBA", "R", "G", "B", "A"]
+    if isinstance(value, str):
+        return [part.strip() for part in re.split(r"[,;\s]+", value) if part.strip()]
+    if isinstance(value, (list, tuple, set)):
+        return [str(part).strip() for part in value if str(part).strip()]
+    return ["RGBA", "R", "G", "B", "A"]
 
 
 def _nearest_existing_frame(path: str, frame: int, node: Node) -> int | None:

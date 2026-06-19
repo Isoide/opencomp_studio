@@ -12,6 +12,9 @@ dependencies = [
     "websockets>=12.0",
 ]
 
+[project.scripts]
+opencomp = "opencomp.cli:main"
+
 [project.optional-dependencies]
 ocio = ["opencolorio>=2.3"]
 exr = ["OpenEXR>=3.2"]

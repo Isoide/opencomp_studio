@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CLI - OpenComp Studio</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <header class="topbar">
+        <div class="brand">OpenComp Studio Docs</div>
+        <nav class="nav" aria-label="Documentation">
+          <a href="index.html">Home</a>
+          <a href="introduction.html">Introduction</a>
+          <a href="nodes.html">Nodes</a>
+          <a href="architecture.html">Architecture</a>
+          <a href="api.html">API</a>
+          <a class="active" href="cli.html">CLI</a>
+        </nav>
+      </header>
+
+      <main>
+        <section class="hero">
+          <div>
+            <div class="eyebrow">Headless workflow</div>
+            <h1>Render and automate `.opencomp` scripts without the browser</h1>
+            <p>
+              The CLI loads OpenComp script files, runs the same Python scripting layer
+              as the in-app Script Editor, and renders Write nodes through the backend evaluator.
+            </p>
+          </div>
+          <div class="card">
+            <pre><code>python -m opencomp.cli shot.opencomp \
+  --render Write1 \
+  --range 1001-1005 \
+  --json</code></pre>
+          </div>
+        </section>
+
+        <section class="section">
+          <h2>Core Commands</h2>
+          <div class="grid">
+            <div class="card"><strong>Save</strong><p><code>--save shot_v002.opencomp</code></p></div>
+            <div class="card"><strong>Inspect</strong><p><code>--list-nodes --list-scripts</code></p></div>
+            <div class="card"><strong>Render</strong><p><code>--render Write1 --range 1001-1010</code></p></div>
+            <div class="card"><strong>Script</strong><p><code>--run-script setup.py --save</code></p></div>
+            <div class="card"><strong>Metadata</strong><p><code>--metadata Read1 --range 1001</code></p></div>
+            <div class="card"><strong>Nuke</strong><p><code>--export-nuke shot.nk</code></p></div>
+          </div>
+        </section>
+
+        <section class="section">
+          <h2>Range Syntax</h2>
+          <table class="table">
+            <tr><th>Syntax</th><th>Meaning</th></tr>
+            <tr><td><code>1001</code></td><td>One frame.</td></tr>
+            <tr><td><code>1001-1005</code></td><td>Inclusive frame range.</td></tr>
+            <tr><td><code>1001,1003,1005</code></td><td>Explicit frame list.</td></tr>
+            <tr><td><code>1001-1010x2</code></td><td>Stepped inclusive range.</td></tr>
+          </table>
+        </section>
+
+        <section class="section">
+          <h2>Script Editor Compatibility</h2>
+          <pre><code>read = opencomp.node("Read1")
+read.value("path").setValue(r"E:\plates\shot_####.exr")
+
+grade = opencomp.create_node("Grade", name="Grade2")
+grade.value("gain").setValue(1.15)
+grade.setInput("in", read)
+
+root.value("name").setValue("shot_comp")</code></pre>
+        </section>
+
+        <section class="section">
+          <h2>Current Limits</h2>
+          <div class="grid">
+            <div class="card"><strong>Write nodes only</strong><p>Headless render intentionally renders Write nodes, matching compositor render semantics.</p></div>
+            <div class="card"><strong>Process-local cache</strong><p>The CLI uses evaluator cache only for the current command process.</p></div>
+            <div class="card"><strong>V1 `.nk`</strong><p>Common OpenComp nodes export as native Nuke blocks; unsupported nodes become labeled NoOp fallbacks.</p></div>
+          </div>
+        </section>
+      </main>
+
+      <footer class="footer">See the Markdown companion: ../CLI.md</footer>
+    </div>
+  </body>
+</html>

@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -16,9 +15,12 @@ from opencomp.core.models import (
     CreateScriptTabRequest,
     CryptomatteMatteRequest,
     CryptomattePickRequest,
+    ExportNukeRequest,
     FrameRequest,
     GraphUpdate,
     HealthResponse,
+    ImportProjectRequest,
+    LoadProjectRequest,
     NodeCatalogItem,
     Project,
     ProjectPreferencesUpdate,
@@ -29,6 +31,14 @@ from opencomp.core.models import (
     SaveProjectRequest,
     ScriptTab,
     SetActiveScriptTabRequest,
+)
+from opencomp.core.project_io import (
+    ensure_project_scripts,
+    export_nuke_project,
+    get_active_script as project_io_get_active_script,
+    load_project_file,
+    normalize_project_for_serialization,
+    save_project_file,
 )
 from opencomp.core.preview_renderer import (
     PreviewRequest,
@@ -44,6 +54,7 @@ from opencomp.io.cryptomatte import (
     cryptomatte_layers,
     pick_cryptomatte_id,
 )
+from opencomp.io.nuke_exporter import build_nuke_script
 from opencomp.nodes import NODE_DEFINITIONS
 from opencomp.nodes.base import NodeEvaluationError
 from opencomp.core.scripting import run_session_script
@@ -64,22 +75,11 @@ def get_project(request: Request) -> Project:
 
 
 def ensure_script_tabs(project: Project) -> None:
-    if not project.script_tabs:
-        project.script_tabs.append(ScriptTab(id="main", name="Comp 1", graph=project.graph, kind="comp"))
-        project.active_script_id = "main"
-    if not any(tab.id == project.active_script_id for tab in project.script_tabs):
-        project.active_script_id = project.script_tabs[0].id
-    project.graph = get_active_script(project).graph
+    ensure_project_scripts(project)
 
 
 def get_active_script(project: Project) -> ScriptTab:
-    if not project.script_tabs:
-        project.script_tabs.append(ScriptTab(id="main", name="Comp 1", graph=project.graph, kind="comp"))
-        project.active_script_id = "main"
-    for tab in project.script_tabs:
-        if tab.id == project.active_script_id:
-            return tab
-    return project.script_tabs[0]
+    return project_io_get_active_script(project)
 
 
 def get_evaluator_from_state(state: Any, project: Project) -> GraphEvaluator:
@@ -112,6 +112,21 @@ def _viewer_preview_cache_bytes(max_cache_bytes: int) -> int:
     return max(64 * 1024 * 1024, min(512 * 1024 * 1024, max_cache_bytes // 2))
 
 
+def install_project_in_state(state: Any, project: Project) -> Project:
+    ensure_script_tabs(project)
+    state.project = project
+    max_cache_bytes = max(0, int(project.preferences.cache_memory_limit_mb)) * 1024 * 1024
+    state.evaluator = GraphEvaluator(
+        settings=project.settings,
+        max_cache_bytes=max_cache_bytes,
+        max_preview_cache_bytes=_viewer_preview_cache_bytes(max_cache_bytes),
+        max_float_preview_cache_bytes=_viewer_preview_cache_bytes(max_cache_bytes),
+    )
+    state.evaluator_settings_key = project.settings.model_dump_json()
+    state.graph_revision = getattr(state, "graph_revision", 0) + 1
+    return project
+
+
 def json_safe(value: Any) -> Any:
     return json.loads(json.dumps(value, default=str))
 
@@ -124,29 +139,57 @@ async def health() -> HealthResponse:
 @router.post("/api/projects/new", response_model=Project)
 async def new_project(request: Request) -> Project:
     project = create_default_project()
-    ensure_script_tabs(project)
-    request.app.state.project = project
-    max_cache_bytes = max(0, int(project.preferences.cache_memory_limit_mb)) * 1024 * 1024
-    request.app.state.evaluator = GraphEvaluator(
-        settings=project.settings,
-        max_cache_bytes=max_cache_bytes,
-        max_preview_cache_bytes=_viewer_preview_cache_bytes(max_cache_bytes),
-        max_float_preview_cache_bytes=_viewer_preview_cache_bytes(max_cache_bytes),
-    )
-    request.app.state.evaluator_settings_key = project.settings.model_dump_json()
-    return project
+    return install_project_in_state(request.app.state, project)
 
 
 @router.post("/api/projects/save", response_model=Project)
 async def save_project(request: Request, payload: SaveProjectRequest) -> Project:
     project = payload.project or get_project(request)
-    ensure_script_tabs(project)
+    normalize_project_for_serialization(project)
     request.app.state.project = project
     if payload.path:
-        path = Path(payload.path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(project.model_dump_json(indent=2), encoding="utf-8")
+        save_project_file(project, payload.path)
     return project
+
+
+@router.post("/api/projects/load", response_model=Project)
+async def load_project(request: Request, payload: LoadProjectRequest) -> Project:
+    try:
+        project = await asyncio.to_thread(load_project_file, payload.path)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return install_project_in_state(request.app.state, project)
+
+
+@router.post("/api/projects/import", response_model=Project)
+async def import_project(request: Request, payload: ImportProjectRequest) -> Project:
+    return install_project_in_state(request.app.state, payload.project)
+
+
+@router.post("/api/projects/export-nuke")
+async def export_nuke(request: Request, payload: ExportNukeRequest):
+    project = payload.project or get_project(request)
+    ensure_script_tabs(project)
+    try:
+        output_path = await asyncio.to_thread(export_nuke_project, project, payload.path)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "status": "exported",
+        "path": str(output_path),
+        "message": "Nuke .nk export written with v1 OpenComp node mappings.",
+    }
+
+
+@router.post("/api/projects/export-nuke/content")
+async def export_nuke_content(request: Request, payload: ExportNukeRequest):
+    project = payload.project or get_project(request)
+    normalize_project_for_serialization(project)
+    try:
+        nuke_text = await asyncio.to_thread(build_nuke_script, project, payload.path)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return Response(content=nuke_text, media_type="text/plain; charset=utf-8")
 
 
 @router.get("/api/projects/settings")
@@ -714,6 +757,21 @@ def _record_viewer_request_timing(evaluator: GraphEvaluator, payload: FrameReque
     )
 
 
+async def _close_websocket_quietly(websocket: WebSocket, code: int = 1000) -> None:
+    try:
+        await websocket.close(code=code)
+    except Exception:
+        return
+
+
+async def _send_websocket_error_quietly(websocket: WebSocket, detail: str) -> None:
+    try:
+        await websocket.send_text(json.dumps({"type": "error", "detail": detail}))
+    except Exception:
+        pass
+    await _close_websocket_quietly(websocket, code=1011)
+
+
 def _viewer_eval_source(
     graph,
     evaluator: GraphEvaluator,
@@ -763,11 +821,12 @@ async def websocket_viewer_frame(websocket: WebSocket):
                 },
             )
             _schedule_viewer_warm(project, active_graph, evaluator, payload)
+            await _close_websocket_quietly(websocket)
+            return
     except WebSocketDisconnect:
         return
     except Exception as exc:
-        await websocket.send_text(json.dumps({"type": "error", "detail": str(exc)}))
-        await websocket.close(code=1011)
+        await _send_websocket_error_quietly(websocket, str(exc))
 
 
 @router.websocket("/ws/viewer/float")
@@ -829,11 +888,12 @@ async def websocket_viewer_float(websocket: WebSocket):
                     "float_cache_hit": header.get("cache_hit", False),
                 },
             )
+            await _close_websocket_quietly(websocket)
+            return
     except WebSocketDisconnect:
         return
     except Exception as exc:
-        await websocket.send_text(json.dumps({"type": "error", "detail": str(exc)}))
-        await websocket.close(code=1011)
+        await _send_websocket_error_quietly(websocket, str(exc))
 
 
 @router.websocket("/ws/events")

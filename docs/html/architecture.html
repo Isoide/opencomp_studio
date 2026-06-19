@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Architecture - OpenComp Studio</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <header class="topbar">
+        <div class="brand">OpenComp Studio Docs</div>
+        <nav class="nav" aria-label="Documentation">
+          <a href="index.html">Home</a>
+          <a href="introduction.html">Introduction</a>
+          <a href="nodes.html">Nodes</a>
+          <a class="active" href="architecture.html">Architecture</a>
+          <a href="api.html">API</a>
+          <a href="cli.html">CLI</a>
+        </nav>
+      </header>
+
+      <main>
+        <section class="hero">
+          <div>
+            <div class="eyebrow">Architecture</div>
+            <h1>Backend image engine, frontend GPU viewer</h1>
+            <p>
+              The backend evaluates scene-linear float frames and streams pre-display
+              float viewer buffers. The frontend caches those buffers and uses WebGL2
+              to apply viewer controls and OCIO display transforms.
+            </p>
+          </div>
+          <div class="screenshot">
+            <img src="../assets/opencomp-metrics.png" alt="OpenComp metrics view" />
+          </div>
+        </section>
+
+        <section class="section">
+          <h2>Data Flow</h2>
+          <div class="flow">
+            <div><strong>Image I/O</strong><br />OpenEXR/Pillow load source frames.</div>
+            <div><strong>ImageFrame</strong><br />float32 RGBA plus channel data and metadata.</div>
+            <div><strong>Evaluator</strong><br />Demand-driven graph traversal and cache signatures.</div>
+            <div><strong>Viewer Stream</strong><br />float16/float32 WebSocket tiles.</div>
+            <div><strong>WebGL2</strong><br />Viewer process and OCIO display shader.</div>
+          </div>
+        </section>
+
+        <section class="section">
+          <h2>Caches</h2>
+          <table class="table">
+            <tr><th>Cache</th><th>Stored Data</th><th>Purpose</th></tr>
+            <tr><td>Node cache</td><td>ImageFrame</td><td>Reuse evaluated graph nodes by node/frame/signature.</td></tr>
+            <tr><td>Float preview cache</td><td>Pre-display float RGBA</td><td>Reuse viewer buffers before display transform.</td></tr>
+            <tr><td>PNG preview cache</td><td>Display-ready PNG bytes</td><td>CPU fallback and cached HTTP/WebSocket image preview.</td></tr>
+            <tr><td>Frontend viewer cache</td><td>Float viewer frames</td><td>Fast playback and instant frame switching in the browser.</td></tr>
+          </table>
+        </section>
+
+        <section class="section">
+          <h2>Threading</h2>
+          <div class="grid">
+            <div class="card"><strong>FastAPI to_thread</strong><p>Moves CPU evaluation and rendering off async request handlers.</p></div>
+            <div class="card"><strong>Row tiles</strong><p>Selected nodes use ThreadPoolExecutor row chunks for CPU parallelism.</p></div>
+            <div class="card"><strong>Viewer warming</strong><p>Background tasks prepare viewer cache without changing the current frame.</p></div>
+          </div>
+        </section>
+
+        <section class="section">
+          <h2>Known Limits</h2>
+          <div class="callout">
+            <p>
+              The graph is still CPU-first. GPU currently accelerates the viewer/display
+              path, not general node evaluation. The next major speed step is true
+              visible-region tiled rendering and upstream proxy-aware evaluation.
+            </p>
+          </div>
+        </section>
+      </main>
+      <footer class="footer">See the Markdown companion: ../ARCHITECTURE.md</footer>
+    </div>
+  </body>
+</html>

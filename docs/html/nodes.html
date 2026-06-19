@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Nodes - OpenComp Studio</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <header class="topbar">
+        <div class="brand">OpenComp Studio Docs</div>
+        <nav class="nav" aria-label="Documentation">
+          <a href="index.html">Home</a>
+          <a href="introduction.html">Introduction</a>
+          <a class="active" href="nodes.html">Nodes</a>
+          <a href="architecture.html">Architecture</a>
+          <a href="api.html">API</a>
+          <a href="cli.html">CLI</a>
+        </nav>
+      </header>
+
+      <main>
+        <section class="hero">
+          <div>
+            <div class="eyebrow">Nodes</div>
+            <h1>Graph nodes are backend operations with frontend canvas controls</h1>
+            <p>
+              The node catalog is registered on the backend and requested by the frontend.
+              Every node evaluates to an ImageFrame, and edges define which upstream frames
+              feed each input socket.
+            </p>
+          </div>
+          <div class="card">
+            <pre><code>NodeDefinition("Merge", "Merge", "Merge", MergeNode(), ("a", "b", "mask"))
+NodeDefinition("Viewer", "Viewer", "Output", ViewerNode(), tuple(str(i) for i in range(10)))</code></pre>
+          </div>
+        </section>
+
+        <section class="section">
+          <h2>Node Categories</h2>
+          <table class="table">
+            <tr><th>Category</th><th>Nodes</th></tr>
+            <tr><td>I/O</td><td>Read, Write</td></tr>
+            <tr><td>Color</td><td>Grade, Exposure, Saturation, Invert, Clamp, Colorspace</td></tr>
+            <tr><td>Channel</td><td>Shuffle, Copy, ChannelMerge, AddChannels, Remove, Premult, Unpremult</td></tr>
+            <tr><td>Merge</td><td>Merge</td></tr>
+            <tr><td>Transform</td><td>Reformat, Scale, Transform</td></tr>
+            <tr><td>Filter</td><td>Blur</td></tr>
+            <tr><td>Keyer</td><td>Cryptomatte</td></tr>
+            <tr><td>Metadata</td><td>ViewMetaData, CompareMetaData, Modify Metadata, CopyMetaData, AddTimeCode</td></tr>
+            <tr><td>Output</td><td>Viewer</td></tr>
+          </table>
+        </section>
+
+        <section class="section">
+          <h2>Evaluation Contract</h2>
+          <pre><code>evaluate(node: Node, inputs: dict[str, ImageFrame], context: EvaluationContext) -> ImageFrame</code></pre>
+          <div class="grid">
+            <div class="card"><strong>Inputs</strong><p>Incoming edges are evaluated before the node itself.</p></div>
+            <div class="card"><strong>Params</strong><p>Knobs live in node.params and are part of the cache signature.</p></div>
+            <div class="card"><strong>Output</strong><p>Each operation returns a new ImageFrame with image data and metadata.</p></div>
+          </div>
+        </section>
+
+        <section class="section">
+          <h2>Core Nodes</h2>
+          <div class="grid two">
+            <div class="card"><strong>Read</strong><p>Loads files, resolves sequences, parses EXR metadata, data windows, pixel aspect, and optional channel groups.</p></div>
+            <div class="card"><strong>Merge</strong><p>Combines A and B inputs with over, under, plus, difference, screen, multiply, copy, matte, and other operations.</p></div>
+            <div class="card"><strong>Reformat</strong><p>Bilinear float resize with bbox/data-window tracking and sparse data-window optimization.</p></div>
+            <div class="card"><strong>Viewer</strong><p>Numbered inputs, active-input evaluation, float preview cache, GPU display path, and playback cache feedback.</p></div>
+          </div>
+        </section>
+      </main>
+      <footer class="footer">See the Markdown companion: ../NODES.md</footer>
+    </div>
+  </body>
+</html>

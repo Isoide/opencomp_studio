@@ -207,7 +207,7 @@ function RootSettings({
         <input
           value={settings.project_path ?? ""}
           onChange={(event) => onSettingsChange({ project_path: event.target.value || null }, false)}
-          placeholder="project.json"
+          placeholder="project.opencomp"
         />
       </label>
       <label>

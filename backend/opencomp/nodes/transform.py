@@ -19,6 +19,7 @@ class ScaleNode:
         scale = float(node.params.get("scale") or 1.0)
         if scale <= 0:
             raise NodeEvaluationError(node.id, "Scale must be greater than zero.")
+        preserve_channels = bool(node.params.get("preserve_channels", node.params.get("resize_channels", False)))
         width = max(1, int(round(source.width * scale)))
         height = max(1, int(round(source.height * scale)))
         data = _resize_float_rgba(source.data, width, height)
@@ -27,11 +28,17 @@ class ScaleNode:
             height=height,
             data=data,
             channels=source.channels,
-            channel_data=_resize_channel_data(source.channel_data, width, height),
+            channel_data=_resize_channel_data(source.channel_data, width, height) if preserve_channels else {},
             pixel_aspect=source.pixel_aspect,
             colorspace=source.colorspace,
             frame=context.frame,
-            metadata={**source.metadata, "scale/factor": scale, "scale/width": width, "scale/height": height},
+            metadata={
+                **source.metadata,
+                "scale/factor": scale,
+                "scale/width": width,
+                "scale/height": height,
+                "scale/preserve_channels": preserve_channels,
+            },
             format_bbox=scale_bbox(source.format_bbox, scale, scale, source.width, source.height),
             data_window=scale_bbox(source.data_window, scale, scale, source.width, source.height),
         )

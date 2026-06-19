@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>API - OpenComp Studio</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <header class="topbar">
+        <div class="brand">OpenComp Studio Docs</div>
+        <nav class="nav" aria-label="Documentation">
+          <a href="index.html">Home</a>
+          <a href="introduction.html">Introduction</a>
+          <a href="nodes.html">Nodes</a>
+          <a href="architecture.html">Architecture</a>
+          <a class="active" href="api.html">API</a>
+          <a href="cli.html">CLI</a>
+        </nav>
+      </header>
+
+      <main>
+        <section class="hero">
+          <div>
+            <div class="eyebrow">API</div>
+            <h1>Control the app through HTTP, WebSockets, and the Python script editor</h1>
+            <p>
+              The backend exposes project, graph, color, viewer, cryptomatte, cache,
+              render, and scripting endpoints. The Script Editor uses the same backend
+              session API to build nodes and change root settings.
+            </p>
+          </div>
+          <div class="card">
+            <pre><code>POST /api/python/run
+GET  /api/graph
+POST /api/viewer/frame
+WS   /ws/viewer/float
+GET  /api/cache/status</code></pre>
+          </div>
+        </section>
+
+        <section class="section">
+          <h2>Endpoint Groups</h2>
+          <table class="table">
+            <tr><th>Group</th><th>Endpoints</th></tr>
+            <tr><td>Project</td><td>/api/projects/new, /api/projects/save, /api/projects/load, /api/projects/import, /api/projects/export-nuke, /api/projects/settings, /api/projects/preferences</td></tr>
+            <tr><td>Graph</td><td>/api/graph</td></tr>
+            <tr><td>Scripts</td><td>/api/scripts, /api/scripts/active, /api/python/run</td></tr>
+            <tr><td>Nodes</td><td>/api/nodes/catalog, /api/nodes/{node_id}/metadata</td></tr>
+            <tr><td>Viewer</td><td>/api/viewer/frame, /ws/viewer/frame, /ws/viewer/float</td></tr>
+            <tr><td>Color</td><td>/api/color/config, /api/color/gpu-shader</td></tr>
+            <tr><td>Cryptomatte</td><td>/api/nodes/{node_id}/cryptomatte, /api/cryptomatte/pick, /api/cryptomatte/matte</td></tr>
+            <tr><td>Cache</td><td>/api/cache/status, /api/cache/clear</td></tr>
+          </table>
+        </section>
+
+        <section class="section">
+          <h2>Project Files</h2>
+          <p>
+            OpenComp project scripts use the <code>.opencomp</code> extension. The API can save/load
+            those files and can write a v1 <code>.nk</code> export with native node blocks and stack connections.
+            The browser UI can also import selected local <code>.opencomp</code> files through
+            <code>/api/projects/import</code>.
+          </p>
+          <pre><code>POST /api/projects/save
+POST /api/projects/load
+POST /api/projects/import
+POST /api/projects/export-nuke
+POST /api/projects/export-nuke/content</code></pre>
+        </section>
+
+        <section class="section">
+          <h2>Script Editor Example</h2>
+          <pre><code>read = opencomp.create_node("Read", name="Read1", path=r"E:\plates\shot_####.exr")
+grade = opencomp.create_node("Grade", name="Grade1", gain=1.2)
+viewer = opencomp.create_node("Viewer", name="Viewer1", active_input="0")
+
+grade.setInput("in", read)
+viewer.setInput("0", grade)
+
+root.value("frame_start").setValue(1001)
+root.value("frame_end").setValue(1010)</code></pre>
+        </section>
+
+        <section class="section">
+          <h2>Float Viewer Stream</h2>
+          <p>
+            The preferred viewer path is a WebSocket frame stream that sends a JSON
+            header followed by binary float tiles. The frontend uploads the frame to
+            WebGL2 and applies display processing there.
+          </p>
+          <pre><code>{
+  "node_id": "Viewer1",
+  "frame": 1001,
+  "channel": "rgba",
+  "precision": "float16",
+  "stream_tiles": true,
+  "tile_height": 128
+}</code></pre>
+        </section>
+      </main>
+      <footer class="footer">See the Markdown companion: ../API.md</footer>
+    </div>
+  </body>
+</html>

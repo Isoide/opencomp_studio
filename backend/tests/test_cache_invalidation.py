@@ -31,7 +31,12 @@ def test_upstream_param_change_invalidates_downstream_cache() -> None:
 def test_read_node_reuses_memory_cache_when_downstream_changes(monkeypatch) -> None:
     calls = 0
 
-    def fake_read_image(path: str, frame: int | None = None, colorspace: str = "ACES2065-1") -> ImageFrame:
+    def fake_read_image(
+        path: str,
+        frame: int | None = None,
+        colorspace: str = "ACES2065-1",
+        read_channels: list[str] | None = None,
+    ) -> ImageFrame:
         nonlocal calls
         calls += 1
         data = np.ones((2, 2, 4), dtype=np.float32)
