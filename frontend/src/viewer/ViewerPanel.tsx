@@ -154,6 +154,7 @@ export function ViewerPanel({
   const imageRef = useRef<HTMLImageElement | null>(null);
   const compareImageRef = useRef<HTMLImageElement | null>(null);
   const imageFormatRef = useRef<string | null>(null);
+  const pendingFitRef = useRef(false);
   const gpuMetricsLabelRef = useRef("");
   const gpuRecoveryRef = useRef<{ key: string; attempts: number }>({ key: "", attempts: 0 });
   const dragRef = useRef<{ x: number; y: number; transform: ViewerTransform } | null>(null);
@@ -161,10 +162,13 @@ export function ViewerPanel({
   const [transform, setTransform] = useState<ViewerTransform>({ x: 0, y: 0, scale: 1 });
   const [imageSize, setImageSize] = useState({ width: 0, height: 0 });
   const [compareImageSize, setCompareImageSize] = useState({ width: 0, height: 0 });
+  const [bitmapRevision, setBitmapRevision] = useState(0);
   const [draftPoints, setDraftPoints] = useState<DraftPoint[]>([]);
   const [showBbox, setShowBbox] = useState(true);
   const [gpuStatus, setGpuStatus] = useState("GPU pending");
   const [pixelSample, setPixelSample] = useState<PixelSample | null>(null);
+  const [cacheHudCollapsed, setCacheHudCollapsed] = useState(true);
+  const [viewerHudCollapsed, setViewerHudCollapsed] = useState(true);
   const pixelAspect =
     gpuFrame?.header.pixel_aspect && gpuFrame.header.pixel_aspect > 0
       ? gpuFrame.header.pixel_aspect
@@ -179,16 +183,61 @@ export function ViewerPanel({
     if (imageSize.width > 0 && imageSize.height > 0) return imageSize;
     return null;
   }, [gpuFrame?.header.height, gpuFrame?.header.width, imageSize.height, imageSize.width]);
+  const cacheHudText = useMemo(() => compactCacheStatus(cacheStatus), [cacheStatus]);
+  const viewerHudText = useMemo(() => {
+    if (!activeSource) return "";
+    const parts = [
+      gpuFrame ? gpuStatus : "CPU PNG",
+      `${Math.round(transform.scale * 100)}%`,
+      selectedChannel.toUpperCase(),
+      `${activeSource.width}x${activeSource.height}`,
+    ];
+    if (pixelAspect !== 1) parts.push(`PA ${pixelAspect.toFixed(3)}`);
+    parts.push(`F${frame}`);
+    if (gpuFrame?.header.partial) {
+      parts.push(`tiles ${gpuFrame.header.tiles_received ?? 0}/${gpuFrame.header.tile_count ?? 0}`);
+    }
+    if (metadata && activeSource.width < metadata.width) {
+      parts.push(`Proxy ${activeSource.width}x${activeSource.height}`);
+    }
+    return parts.join(" | ");
+  }, [
+    activeSource,
+    frame,
+    gpuFrame,
+    gpuFrame?.header.partial,
+    gpuFrame?.header.tile_count,
+    gpuFrame?.header.tiles_received,
+    gpuStatus,
+    metadata,
+    pixelAspect,
+    selectedChannel,
+    transform.scale,
+  ]);
+  const compactViewerHudText = useMemo(() => {
+    const kind = gpuFrame ? (gpuStatus.toLowerCase().includes("fallback") ? "GPU fallback" : "GPU") : "CPU";
+    return `${kind} | F${frame} | ${Math.round(transform.scale * 100)}%`;
+  }, [frame, gpuFrame, gpuStatus, transform.scale]);
+
+  useEffect(() => {
+    setCacheHudCollapsed(true);
+    setViewerHudCollapsed(true);
+  }, []);
 
   const fitImage = useCallback(() => {
     const canvas = canvasRef.current;
     const source = activeSource;
     if (!canvas || !source) return;
     const rect = canvas.getBoundingClientRect();
+    if (rect.width < 2 || rect.height < 2) {
+      pendingFitRef.current = true;
+      return;
+    }
     const displayWidth = source.width * pixelAspect;
     const displayHeight = source.height;
     const scale = Math.min(rect.width / displayWidth, rect.height / displayHeight) * 0.94;
     const nextScale = Number.isFinite(scale) && scale > 0 ? scale : 1;
+    pendingFitRef.current = false;
     setTransform({
       scale: nextScale,
       x: (rect.width - displayWidth * nextScale) / 2,
@@ -375,6 +424,7 @@ export function ViewerPanel({
       drawBboxOverlay(ctx, metadata, activeSource, transform, pixelAspect);
     }
     drawDraftGeometry(ctx, draftPoints, transform, pixelAspect);
+    drawResolutionBadge(ctx, `${activeSource.width}x${activeSource.height}`, transform, displayWidth, displayHeight, rect.width, rect.height);
   }, [
     activeSource,
     compareEnabled,
@@ -412,7 +462,11 @@ export function ViewerPanel({
       imageRef.current = image;
       imageFormatRef.current = formatKey;
       setImageSize({ width: image.naturalWidth, height: image.naturalHeight });
-      if (shouldFit) fitImage();
+      setBitmapRevision((revision) => revision + 1);
+      if (shouldFit) {
+        pendingFitRef.current = true;
+        window.requestAnimationFrame(() => fitImage());
+      }
     };
     image.src = imageUrl;
   }, [fitImage, gpuFrame, imageUrl, pixelAspect]);
@@ -427,7 +481,10 @@ export function ViewerPanel({
         ? current
         : { width: gpuFrame.header.width, height: gpuFrame.header.height },
     );
-    if (shouldFit) window.setTimeout(fitImage, 0);
+    if (shouldFit) {
+      pendingFitRef.current = true;
+      window.requestAnimationFrame(() => fitImage());
+    }
   }, [fitImage, gpuFrame, pixelAspect]);
 
   useEffect(() => {
@@ -444,19 +501,34 @@ export function ViewerPanel({
     image.onload = () => {
       compareImageRef.current = image;
       setCompareImageSize({ width: image.naturalWidth, height: image.naturalHeight });
+      setBitmapRevision((revision) => revision + 1);
     };
     image.src = compareImageUrl;
   }, [compareImageUrl]);
 
   useEffect(() => {
     draw();
-  }, [draw, imageSize]);
+  }, [bitmapRevision, draw, imageSize]);
 
   useEffect(() => {
     const handleResize = () => draw();
     window.addEventListener("resize", handleResize);
     return () => window.removeEventListener("resize", handleResize);
   }, [draw]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return undefined;
+    const observer = new ResizeObserver(() => {
+      if (pendingFitRef.current && activeSource) {
+        fitImage();
+        return;
+      }
+      draw();
+    });
+    observer.observe(canvas);
+    return () => observer.disconnect();
+  }, [activeSource, draw, fitImage]);
 
   useEffect(() => {
     const gpuCanvas = gpuCanvasRef.current;
@@ -588,7 +660,6 @@ export function ViewerPanel({
           />
           <button onClick={() => onProxyEnabledChange(false)}>Full Res</button>
         </div>
-        <div className="cache-pill">{cacheStatus}</div>
       </div>
       <div className="viewer-tool-strip">
         <div className="segmented-tools" aria-label="Viewer tools">
@@ -832,17 +903,34 @@ export function ViewerPanel({
             });
           }}
         />
+        <button
+          type="button"
+          className={cacheHudCollapsed ? "cache-pill viewer-cache-hud viewer-hud-toggle collapsed" : "cache-pill viewer-cache-hud viewer-hud-toggle"}
+          title={cacheStatus}
+          aria-label={cacheHudCollapsed ? "Expand cache status" : "Collapse cache status"}
+          onPointerDown={(event) => event.stopPropagation()}
+          onClick={(event) => {
+            event.stopPropagation();
+            setCacheHudCollapsed((value) => !value);
+          }}
+        >
+          {cacheHudCollapsed ? cacheHudText : cacheStatus}
+        </button>
         {!imageUrl && !gpuFrame && <div className="empty-viewer">No frame</div>}
         {activeSource && (
-          <div className="viewer-hud">
-            {gpuFrame ? gpuStatus : "CPU PNG"} | {Math.round(transform.scale * 100)}% | {selectedChannel.toUpperCase()} | {activeSource.width}x
-            {activeSource.height}
-            {pixelAspect !== 1 ? ` | PA ${pixelAspect.toFixed(3)}` : ""} | F{frame}
-            {gpuFrame?.header.partial
-              ? ` | tiles ${gpuFrame.header.tiles_received ?? 0}/${gpuFrame.header.tile_count ?? 0}`
-              : ""}
-            {metadata && activeSource.width < metadata.width ? ` | Proxy ${activeSource.width}x${activeSource.height}` : ""}
-          </div>
+          <button
+            type="button"
+            className={viewerHudCollapsed ? "viewer-hud viewer-hud-toggle collapsed" : "viewer-hud viewer-hud-toggle"}
+            title={viewerHudText}
+            aria-label={viewerHudCollapsed ? "Expand viewer status" : "Collapse viewer status"}
+            onPointerDown={(event) => event.stopPropagation()}
+            onClick={(event) => {
+              event.stopPropagation();
+              setViewerHudCollapsed((value) => !value);
+            }}
+          >
+            {viewerHudCollapsed ? compactViewerHudText : viewerHudText}
+          </button>
         )}
         {pixelSample && <PixelReadout sample={pixelSample} />}
       </div>
@@ -1027,6 +1115,11 @@ function FrameRulerSlider({ frame, frameStart, frameEnd, cachedFrames, onFrameCh
   );
 }
 
+function compactCacheStatus(status: string) {
+  const match = status.match(/^cache:\s*([^|]+)/i);
+  return match ? `cache ${match[1].trim()}` : "cache";
+}
+
 function drawCheckerboard(ctx: CanvasRenderingContext2D, width: number, height: number) {
   const size = 16;
   for (let y = 0; y < height; y += size) {
@@ -1036,6 +1129,41 @@ function drawCheckerboard(ctx: CanvasRenderingContext2D, width: number, height: 
       ctx.fillRect(x, y, size, size);
     }
   }
+}
+
+function drawResolutionBadge(
+  ctx: CanvasRenderingContext2D,
+  label: string,
+  transform: ViewerTransform,
+  displayWidth: number,
+  displayHeight: number,
+  canvasWidth: number,
+  canvasHeight: number,
+) {
+  const imageRight = transform.x + displayWidth * transform.scale;
+  const imageBottom = transform.y + displayHeight * transform.scale;
+  if (imageRight < 0 || imageBottom < 0 || transform.x > canvasWidth || transform.y > canvasHeight) return;
+
+  ctx.save();
+  ctx.font = '10px ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace';
+  ctx.textBaseline = "middle";
+  const width = Math.ceil(ctx.measureText(label).width) + 9;
+  const height = 14;
+  const outsideX = imageRight + 4;
+  const insideX = imageRight - width - 4;
+  const x = outsideX + width <= canvasWidth - 4 ? outsideX : insideX;
+  const y = imageBottom + 2 + height <= canvasHeight - 4 ? imageBottom + 2 : imageBottom - height - 4;
+  const clampedX = clamp(x, 4, Math.max(4, canvasWidth - width - 4));
+  const clampedY = clamp(y, 4, Math.max(4, canvasHeight - height - 4));
+
+  ctx.fillStyle = "rgba(12, 12, 12, 0.72)";
+  ctx.strokeStyle = "#8a8a8a";
+  ctx.lineWidth = 1;
+  ctx.fillRect(clampedX, clampedY, width, height);
+  ctx.strokeRect(clampedX + 0.5, clampedY + 0.5, width - 1, height - 1);
+  ctx.fillStyle = "#d6d6d6";
+  ctx.fillText(label, clampedX + 5, clampedY + height / 2 + 0.5);
+  ctx.restore();
 }
 
 function resizeCanvas(canvas: HTMLCanvasElement, rect: DOMRect, ratio: number) {
@@ -1088,12 +1216,9 @@ function PixelReadout({ sample }: { sample: PixelSample }) {
 function sampleFloatPixel(frame: FloatViewerFrame, x: number, y: number): PixelSample | null {
   const { width, height, source_width: sourceWidth, source_height: sourceHeight } = frame.header;
   if (x < 0 || y < 0 || x >= width || y >= height) return null;
-  const index = (y * width + x) * 4;
-  if (index + 3 >= frame.pixels.length) return null;
-  const r = finitePixelValue(sampleFrameValue(frame, index));
-  const g = finitePixelValue(sampleFrameValue(frame, index + 1));
-  const b = finitePixelValue(sampleFrameValue(frame, index + 2));
-  const a = finitePixelValue(sampleFrameValue(frame, index + 3));
+  const rgba = sampleFrameRgba(frame, y * width + x);
+  if (!rgba) return null;
+  const [r, g, b, a] = rgba.map(finitePixelValue) as [number, number, number, number];
   return {
     x: mapProxyCoordinateToSource(x, width, sourceWidth),
     y: mapProxyCoordinateToSource(y, height, sourceHeight),
@@ -1104,9 +1229,36 @@ function sampleFloatPixel(frame: FloatViewerFrame, x: number, y: number): PixelS
   };
 }
 
-function sampleFrameValue(frame: FloatViewerFrame, index: number) {
-  const value = frame.pixels[index];
-  return frame.header.dtype === "float16" ? halfToFloat(value) : value;
+function sampleFrameRgba(frame: FloatViewerFrame, pixelIndex: number): [number, number, number, number] | null {
+  if (frame.header.dtype === "rgb10a2") {
+    if (pixelIndex >= frame.pixels.length) return null;
+    const packed = frame.pixels[pixelIndex] ?? 0;
+    return [
+      (packed & 0x3ff) / 1023,
+      ((packed >>> 10) & 0x3ff) / 1023,
+      ((packed >>> 20) & 0x3ff) / 1023,
+      ((packed >>> 30) & 0x03) / 3,
+    ];
+  }
+  const index = pixelIndex * 4;
+  if (index + 3 >= frame.pixels.length) return null;
+  if (frame.header.dtype === "float16") {
+    return [
+      halfToFloat(frame.pixels[index]),
+      halfToFloat(frame.pixels[index + 1]),
+      halfToFloat(frame.pixels[index + 2]),
+      halfToFloat(frame.pixels[index + 3]),
+    ];
+  }
+  if (frame.header.dtype === "uint8") {
+    return [
+      frame.pixels[index] / 255,
+      frame.pixels[index + 1] / 255,
+      frame.pixels[index + 2] / 255,
+      frame.pixels[index + 3] / 255,
+    ];
+  }
+  return [frame.pixels[index], frame.pixels[index + 1], frame.pixels[index + 2], frame.pixels[index + 3]];
 }
 
 function halfToFloat(value: number) {

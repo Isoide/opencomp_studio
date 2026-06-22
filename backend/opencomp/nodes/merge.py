@@ -18,47 +18,53 @@ class MergeNode:
     ) -> ImageFrame:
         operation = str(node.params.get("operation") or "over").lower()
         mix = float(node.params.get("mix", 1.0))
-        a = inputs.get("a") or inputs.get("fg") or inputs.get("in")
-        b = inputs.get("b") or inputs.get("bg")
+        a_inputs = _ordered_a_inputs(inputs)
+        first_a = a_inputs[0] if a_inputs else None
+        b_input = inputs.get("b") or inputs.get("bg")
+        b = b_input
         mask = inputs.get("mask")
-        if a is None:
+        if first_a is None:
             raise NodeEvaluationError(node.id, "Merge requires at least an A/foreground input.")
         if b is None:
-            b = _transparent_like(a)
-        if a.data.shape != b.data.shape:
-            raise NodeEvaluationError(node.id, "Merge inputs must have matching resolution for MVP.")
-        if mask is not None and mask.data.shape != a.data.shape:
+            b = _transparent_like(first_a)
+        for a in a_inputs:
+            if a.data.shape != b.data.shape:
+                raise NodeEvaluationError(node.id, "Merge inputs must have matching resolution for MVP.")
+        if mask is not None and mask.data.shape != b.data.shape:
             raise NodeEvaluationError(node.id, "Merge mask must match the A/B resolution for MVP.")
 
+        data = b.data
         try:
-            data = merge_rgba(
-                a.data,
-                b.data,
-                operation,
-                mix=mix,
-                mask=mask,
-                mask_channel=str(node.params.get("mask") or node.params.get("mask_channel") or "rgba.alpha"),
-                invert_mask=bool(node.params.get("invert_mask", False)),
-                settings=context.settings,
-            )
+            for a in a_inputs:
+                data = merge_rgba(
+                    a.data,
+                    data,
+                    operation,
+                    mix=mix,
+                    mask=mask,
+                    mask_channel=str(node.params.get("mask") or node.params.get("mask_channel") or "rgba.alpha"),
+                    invert_mask=bool(node.params.get("invert_mask", False)),
+                    settings=context.settings,
+                )
         except ValueError as exc:
             raise NodeEvaluationError(node.id, str(exc)) from exc
 
         metadata_from = str(node.params.get("metadata_from", node.params.get("metainput", "b"))).lower()
-        metadata = _metadata_from(a, b, metadata_from)
+        metadata_source = _metadata_source(a_inputs, b, b_input is not None, metadata_from)
+        metadata = _metadata_from_many(a_inputs, b, metadata_from)
         metadata.update(
             {
                 "merge/operation": operation,
                 "merge/metadata_from": metadata_from,
-                "merge/a": a.metadata.get("input/filename"),
-                "merge/b": b.metadata.get("input/filename"),
+                "merge/a": first_a.metadata.get("input/filename"),
+                "merge/a_inputs": [frame.metadata.get("input/filename") for frame in a_inputs],
+                "merge/b": b_input.metadata.get("input/filename") if b_input is not None else None,
                 "merge/a_channels": node.params.get("a_channels", node.params.get("Achannels", "rgba")),
                 "merge/b_channels": node.params.get("b_channels", node.params.get("Bchannels", "rgba")),
                 "merge/output": node.params.get("output", "rgba"),
                 "merge/bbox": node.params.get("bbox", node.params.get("set_bbox", "union")),
             }
         )
-        metadata_source = a if metadata_from == "a" else b
         bbox_mode = str(node.params.get("bbox", node.params.get("set_bbox", "union"))).lower()
         return ImageFrame(
             width=b.width,
@@ -71,8 +77,40 @@ class MergeNode:
             frame=context.frame,
             metadata=metadata,
             format_bbox=b.format_bbox,
-            data_window=_merged_data_window(a, b, bbox_mode),
+            data_window=_merged_data_window(a_inputs, b, bbox_mode),
         )
+
+
+def _ordered_a_inputs(inputs: dict[str, ImageFrame]) -> list[ImageFrame]:
+    ordered: list[ImageFrame] = []
+    for socket in ("a", "fg", "in"):
+        if socket in inputs:
+            ordered.append(inputs[socket])
+            break
+    numbered = []
+    for socket, frame in inputs.items():
+        key = socket.strip().lower()
+        if key.startswith("a") and key[1:].isdigit():
+            numbered.append((int(key[1:]), frame))
+    ordered.extend(frame for _index, frame in sorted(numbered, key=lambda item: item[0]))
+    return ordered
+
+
+def _metadata_source(a_inputs: list[ImageFrame], b: ImageFrame, has_real_b: bool, metadata_from: str) -> ImageFrame:
+    if metadata_from == "a" or not has_real_b:
+        return a_inputs[0]
+    return b
+
+
+def _metadata_from_many(a_inputs: list[ImageFrame], b: ImageFrame, metadata_from: str) -> dict:
+    if metadata_from == "a":
+        return dict(a_inputs[0].metadata)
+    if metadata_from == "all":
+        metadata = dict(b.metadata)
+        for frame in a_inputs:
+            metadata.update(frame.metadata)
+        return metadata
+    return dict(b.metadata)
 
 
 def merge_rgba(
@@ -145,7 +183,7 @@ def _merge_rgba_full(
     a_alpha = np.clip(fg[:, :, 3:4], 0.0, 1.0)
     b_alpha = np.clip(bg[:, :, 3:4], 0.0, 1.0)
 
-    operation = operation.lower().replace(" ", "_")
+    operation = operation.lower().replace(" ", "_").replace("-", "_")
     if operation == "over":
         data = fg + bg * (1.0 - a_alpha)
     elif operation == "under":
@@ -170,10 +208,24 @@ def _merge_rgba_full(
         data = bg - fg
     elif operation in {"difference", "absminus"}:
         data = np.abs(fg - bg)
+    elif operation == "exclusion":
+        data = fg + bg - (2.0 * fg * bg)
+    elif operation == "grain_extract":
+        data = bg - fg + 0.5
+    elif operation == "grain_merge":
+        data = bg + fg - 0.5
+    elif operation == "hypot":
+        data = np.sqrt((fg * fg) + (bg * bg))
     elif operation == "multiply":
         data = np.where((fg < 0) & (bg < 0), fg, fg * bg)
     elif operation == "screen":
         data = fg + bg - (fg * bg)
+    elif operation == "overlay":
+        data = np.where(bg <= 0.5, 2.0 * fg * bg, 1.0 - (2.0 * (1.0 - fg) * (1.0 - bg)))
+    elif operation == "hard_light":
+        data = np.where(fg <= 0.5, 2.0 * fg * bg, 1.0 - (2.0 * (1.0 - fg) * (1.0 - bg)))
+    elif operation == "soft_light":
+        data = np.where(fg <= 0.5, bg - (1.0 - 2.0 * fg) * bg * (1.0 - bg), bg + (2.0 * fg - 1.0) * (_soft_light_d(bg) - bg))
     elif operation == "max":
         data = np.maximum(fg, bg)
     elif operation == "min":
@@ -189,7 +241,8 @@ def _merge_rgba_full(
     else:
         raise ValueError(
             "Unsupported Merge operation. Use over, under, atop, in, out, plus, minus, from, "
-            "difference, multiply, screen, max, min, average, divide, mask, stencil, xor, matte, or copy."
+            "difference, exclusion, grain_extract, grain_merge, hypot, multiply, overlay, hard_light, "
+            "soft_light, screen, max, min, average, divide, mask, stencil, xor, matte, or copy."
         )
 
     if mask is not None:
@@ -201,6 +254,10 @@ def _merge_rgba_full(
     return np.ascontiguousarray(data.astype(np.float32))
 
 
+def _soft_light_d(value: np.ndarray) -> np.ndarray:
+    return np.where(value <= 0.25, ((16.0 * value - 12.0) * value + 4.0) * value, np.sqrt(np.maximum(value, 0.0)))
+
+
 def _mask_alpha(mask: ImageFrame | np.ndarray, mask_channel: str, invert_mask: bool) -> np.ndarray:
     if isinstance(mask, ImageFrame):
         if mask_channel.strip().lower() in {"", "none", "disabled"}:
@@ -210,14 +267,6 @@ def _mask_alpha(mask: ImageFrame | np.ndarray, mask_channel: str, invert_mask: b
         plane = mask[:, :, 3] if mask.ndim == 3 and mask.shape[2] >= 4 else mask
     alpha = np.clip(np.asarray(plane, dtype=np.float32), 0.0, 1.0)[:, :, None]
     return 1.0 - alpha if invert_mask else alpha
-
-
-def _metadata_from(a: ImageFrame, b: ImageFrame, metadata_from: str) -> dict:
-    if metadata_from == "a":
-        return dict(a.metadata)
-    if metadata_from == "all":
-        return {**a.metadata, **b.metadata}
-    return dict(b.metadata)
 
 
 def _transparent_like(frame: ImageFrame) -> ImageFrame:
@@ -235,11 +284,11 @@ def _transparent_like(frame: ImageFrame) -> ImageFrame:
     )
 
 
-def _merged_data_window(a: ImageFrame, b: ImageFrame, bbox_mode: str) -> dict[str, int]:
+def _merged_data_window(a_inputs: list[ImageFrame], b: ImageFrame, bbox_mode: str) -> dict[str, int]:
     if bbox_mode in {"a", "a input", "input a"}:
-        return dict(a.data_window or {})
+        return union_bbox(*(frame.data_window for frame in a_inputs))
     if bbox_mode in {"b", "b input", "input b"}:
         return dict(b.data_window or {})
     if bbox_mode in {"intersect", "intersection"}:
-        return intersect_bbox(a.data_window, b.data_window)
-    return union_bbox(a.data_window, b.data_window)
+        return intersect_bbox(b.data_window, *(frame.data_window for frame in a_inputs))
+    return union_bbox(b.data_window, *(frame.data_window for frame in a_inputs))

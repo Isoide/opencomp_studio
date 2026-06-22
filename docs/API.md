@@ -304,9 +304,10 @@ read = opencomp.create_node(
     colorspace="ACES2065-1",
     frame_start=1001,
     frame_end=1010,
-    read_all_channels=False,
 )
 ```
+
+Read nodes use smart channel demand by default: RGBA is loaded first, and extra AOVs are loaded when a node or viewer request references them. Use `read_all_channels=True` or `read_channels="all"` only when you explicitly need every layer.
 
 ### Find Nodes
 
@@ -387,7 +388,6 @@ plate = opencomp.create_node(
     colorspace="ACES2065-1",
     frame_start=1001,
     frame_end=1010,
-    read_all_channels=False,
 )
 
 render = opencomp.create_node(
@@ -398,7 +398,6 @@ render = opencomp.create_node(
     colorspace="ACES2065-1",
     frame_start=1001,
     frame_end=1010,
-    read_all_channels=False,
 )
 
 grade = opencomp.create_node("Grade", name="Grade_Render", position=[420, 240], gain=1.1)
@@ -527,10 +526,13 @@ Payload:
   "channel": "rgba",
   "viewer_input": "0",
   "precision": "float16",
+  "transfer_mode": "float16-rgba",
   "stream_tiles": true,
   "tile_height": 128
 }
 ```
+
+Supported viewer precision values are `float32`, `float16`, `rgb10a2`, and `uint8`. Use `float16` for the default scene-linear GPU viewer path. Use `rgb10a2` or `uint8` only as smaller preview delivery modes because they clamp and quantize the stream.
 
 Response sequence:
 
@@ -564,7 +566,7 @@ Response sequence:
 }
 ```
 
-The frontend assembles the float buffer and uploads it to WebGL.
+The frontend assembles the viewer buffer and uploads it to WebGL.
 
 ## Cryptomatte
 

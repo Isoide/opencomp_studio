@@ -34,6 +34,7 @@ const ADDABLE_NODES = [
   "Clamp",
   "Colorspace",
   "Blur",
+  "Crop",
   "Shuffle",
   "Copy",
   "ChannelMerge",
@@ -179,6 +180,7 @@ export default function App() {
   const lastSyncedGraphRef = useRef("");
   const skipNextAutoRefreshRef = useRef(false);
   const lastCompletedAutoRefreshKeyRef = useRef<string | null>(null);
+  const firstVisibleFrameRequestRef = useRef<{ key: string; attempts: number }>({ key: "", attempts: 0 });
   const idlePrefetchTimerRef = useRef<number | null>(null);
   const idlePrefetchControllerRef = useRef<AbortController | null>(null);
   const idlePrefetchSessionRef = useRef(0);
@@ -193,6 +195,8 @@ export default function App() {
     misses: 0,
     evictions: 0,
   });
+  const frontendViewerInflightRef = useRef<Map<string, Promise<FrontendFloatFrameResult>>>(new Map());
+  const viewerRenderRequestIdRef = useRef(0);
   const lastCacheStatusRef = useRef<CacheStatus | null>(null);
   const renderRevisionRef = useRef(renderRevision);
   const latestRef = useRef({
@@ -211,6 +215,7 @@ export default function App() {
     viewerCompareMode,
     viewerCompareInputA,
     viewerCompareInputB,
+    isPlaying,
     viewerNodeId: "Viewer1",
     viewerUrl,
   });
@@ -285,6 +290,7 @@ export default function App() {
       viewerCompareMode,
       viewerCompareInputA,
       viewerCompareInputB,
+      isPlaying,
       viewerNodeId,
       viewerUrl,
     };
@@ -295,6 +301,7 @@ export default function App() {
     cryptoSelection,
     frame,
     graph,
+    isPlaying,
     project,
     viewerChannel,
     viewerCompareEnabled,
@@ -346,15 +353,7 @@ export default function App() {
       setMetricsStatus(status);
       setActiveRuntimeNodeIds(status.active_nodes);
       setNodeTimings(status.node_timings);
-      setCachedFrames(
-        mergeFrameLists(
-          status.cached_frames?.length ? status.cached_frames : status.cached_all_frames ?? [],
-          frontendViewerCachedFrames(
-            frontendViewerCacheRef.current,
-            frontendCacheFrameContext(latestRef.current, renderRevisionRef.current),
-          ),
-        ),
-      );
+      setCachedFrames(viewerReadyCachedFrames(frontendViewerCacheRef.current, latestRef.current, renderRevisionRef.current));
       refreshCacheStatusLabel(status);
     } catch {
       setCacheStatus("cache: unavailable");
@@ -366,6 +365,19 @@ export default function App() {
   const handleViewerGpuMetrics = useCallback((metrics: WebglViewerMetrics | null) => {
     viewerGpuMetricsRef.current = metrics;
     setViewerGpuMetrics(metrics);
+    if (metrics) {
+      setFrontendRequestTimings((currentTimings) => {
+        if (currentTimings.length === 0) return currentTimings;
+        const next = [...currentTimings];
+        const last = next[next.length - 1];
+        next[next.length - 1] = {
+          ...last,
+          webgl_upload_ms: metrics.upload_ms,
+          webgl_draw_ms: metrics.draw_ms,
+        };
+        return next;
+      });
+    }
     refreshCacheStatusLabel();
   }, [refreshCacheStatusLabel]);
 
@@ -382,30 +394,52 @@ export default function App() {
   );
 
   useEffect(() => {
+    let cancelled = false;
     async function boot() {
-      try {
-        const health = await client.health();
-        setBackendStatus(`${health.status}: ${health.app}`);
-        const catalog = await client.nodeCatalog();
-        setNodeCatalog(catalog);
-        const newProject = await client.newProject();
-        setProject(newProject);
-        const config = await loadColorConfig();
-        const settings = {
-          ...newProject.settings,
-          viewer_display: newProject.settings.viewer_display ?? config.default_display,
-          viewer_view: newProject.settings.viewer_view ?? config.default_view,
-        };
-        await client.putProjectSettings(settings);
-        setProject({ ...newProject, settings });
-        await loadCacheStatus();
-        addLog("info", "Backend connected and reference sequence project loaded.");
-      } catch (error) {
-        setBackendStatus("offline");
-        addLog("error", error instanceof Error ? error.message : String(error));
+      const retryDelays = [0, 350, 750, 1250, 2000, 3000];
+      let lastError: unknown = null;
+      for (let attempt = 0; attempt < retryDelays.length; attempt += 1) {
+        if (cancelled) return;
+        if (retryDelays[attempt] > 0) {
+          setBackendStatus(`connecting (${attempt + 1}/${retryDelays.length})`);
+          await sleep(retryDelays[attempt]);
+        }
+        try {
+          const health = await client.health();
+          if (cancelled) return;
+          setBackendStatus(`${health.status}: ${health.app}`);
+          const catalog = await client.nodeCatalog();
+          if (cancelled) return;
+          setNodeCatalog(catalog);
+          const newProject = await client.newProject();
+          if (cancelled) return;
+          const config = await loadColorConfig();
+          if (cancelled) return;
+          const settings = {
+            ...newProject.settings,
+            viewer_display: newProject.settings.viewer_display ?? config.default_display,
+            viewer_view: newProject.settings.viewer_view ?? config.default_view,
+          };
+          await client.putProjectSettings(settings);
+          if (cancelled) return;
+          setProject({ ...newProject, settings });
+          lastSyncedSettingsRef.current = JSON.stringify(settings);
+          lastSyncedGraphRef.current = JSON.stringify(newProject.graph);
+          await loadCacheStatus();
+          if (!cancelled) addLog("info", "Backend connected and reference sequence project loaded.");
+          return;
+        } catch (error) {
+          lastError = error;
+        }
       }
+      if (cancelled) return;
+      setBackendStatus("offline");
+      addLog("error", lastError instanceof Error ? lastError.message : String(lastError ?? "Backend unavailable."));
     }
     void boot();
+    return () => {
+      cancelled = true;
+    };
   }, [addLog, loadCacheStatus, loadColorConfig, setBackendStatus, setProject]);
 
   useEffect(() => {
@@ -580,39 +614,107 @@ export default function App() {
         snapshot.viewerChannel,
         viewerInput,
       );
+      const cacheLookupStarted = performance.now();
       const cachedFrame = getFrontendViewerFrame(frontendViewerCacheRef.current, cacheKey);
       if (cachedFrame) {
-        return { frame: cachedFrame, bytes: 0, frontendCacheHit: true };
+        const browserCacheHitMs = performance.now() - cacheLookupStarted;
+        return {
+          frame: {
+            ...cachedFrame,
+            metrics: {
+              ws_wait_ms: 0,
+              receive_ms: 0,
+              tile_copy_ms: 0,
+              bytes: 0,
+              browser_cache_hit_ms: Math.round(browserCacheHitMs * 100) / 100,
+            },
+          },
+          bytes: 0,
+          frontendCacheHit: true,
+        };
       }
-      const frameData = await client.viewerFloatFrameStream(
-        snapshot.viewerNodeId,
-        frameNumber,
-        snapshot.project.settings.viewer_display,
-        snapshot.project.settings.viewer_view,
-        snapshot.viewerChannel,
-        signal,
-        viewerInput === null ? {} : { viewerInput },
-        onProgress,
-      );
-      storeFrontendViewerFrame(
-        frontendViewerCacheRef.current,
-        cacheKey,
-        frameData,
-        frontendViewerCacheLimitBytes(snapshot.project),
-      );
-      return { frame: frameData, bytes: frameData.header.byte_length, frontendCacheHit: false };
+      const inFlight = frontendViewerInflightRef.current.get(cacheKey);
+      if (inFlight) return inFlight;
+
+      const requestPromise = (async () => {
+        const settings = snapshot.project!.settings;
+        const viewerPrecision = snapshot.project!.preferences.viewer_transfer_precision ?? "float16";
+        const frameData = await client.viewerFloatFrameStream(
+          snapshot.viewerNodeId,
+          frameNumber,
+          settings.viewer_display,
+          settings.viewer_view,
+          snapshot.viewerChannel,
+          signal,
+          {
+            ...(viewerInput === null ? {} : { viewerInput }),
+            precision: viewerPrecision,
+            tileHeight: settings.tile_height ?? 128,
+            tileLanes: Math.max(1, Math.min(Math.round(settings.viewer_tile_lanes ?? 1), 8)),
+            transferMode: transferModeForPrecision(viewerPrecision),
+          },
+          onProgress,
+        );
+        storeFrontendViewerFrame(
+          frontendViewerCacheRef.current,
+          cacheKey,
+          frameData,
+          frontendViewerCacheLimitBytes(snapshot.project),
+        );
+        return { frame: frameData, bytes: frameData.header.byte_length, frontendCacheHit: false };
+      })();
+
+      frontendViewerInflightRef.current.set(cacheKey, requestPromise);
+      try {
+        return await requestPromise;
+      } finally {
+        if (frontendViewerInflightRef.current.get(cacheKey) === requestPromise) {
+          frontendViewerInflightRef.current.delete(cacheKey);
+        }
+      }
     },
     [],
+  );
+
+  const resetFrontendViewerCache = useCallback(() => {
+    clearFrontendViewerCache(frontendViewerCacheRef.current);
+    frontendViewerInflightRef.current.clear();
+    lastCompletedAutoRefreshKeyRef.current = null;
+    firstVisibleFrameRequestRef.current = { key: "", attempts: 0 };
+  }, []);
+
+  const scheduleReadPreload = useCallback(
+    (frames: number[], snapshot: typeof latestRef.current) => {
+      const snapshotProject = snapshot.project;
+      if (!snapshotProject || !snapshotProject.preferences.read_preload_enabled || frames.length === 0) return;
+      const maxFrames = Math.max(1, Math.round(snapshotProject.preferences.read_preload_max_frames ?? 6));
+      const boundedFrames = [
+        ...new Set(frames.map((value) => clampFrame(value, snapshotProject.settings.frame_start, snapshotProject.settings.frame_end))),
+      ].slice(0, maxFrames);
+      const inputs = snapshot.viewerCompareEnabled ? [snapshot.viewerCompareInputA, snapshot.viewerCompareInputB] : [null];
+      for (const viewerInput of inputs) {
+        void client
+          .warmReadFrames(snapshot.viewerNodeId, boundedFrames, { viewerInput, channel: snapshot.viewerChannel })
+          .catch((error) => {
+            if (!(error instanceof DOMException && error.name === "AbortError")) {
+              addLog("error", `Read preload failed: ${error instanceof Error ? error.message : String(error)}`);
+            }
+          });
+      }
+    },
+    [addLog],
   );
 
   const renderViewerFrame = useCallback(
     async (frameNumber: number, controller: AbortController) => {
       const current = latestRef.current;
       if (!current.graph || !current.project) return false;
+      const requestId = ++viewerRenderRequestIdRef.current;
+      const isCurrentRequest = () => !controller.signal.aborted && viewerRenderRequestIdRef.current === requestId;
 
       await syncGraphAndSettings();
       const latest = latestRef.current;
-      if (!latest.project || controller.signal.aborted) return false;
+      if (!latest.project || !isCurrentRequest()) return false;
 
       const selectedMatteIds = latest.cryptoSelection.map((selection) => selection.id);
       const proxyWidth = latest.project.settings.proxy_enabled ? latest.project.settings.viewer_max_width : null;
@@ -678,8 +780,11 @@ export default function App() {
       let payloadBytes = 0;
       let servedFromFrontendViewerCache = false;
       let partialShaderRequested = false;
+      let clientFrameMetrics: FloatViewerFrame["metrics"] | null = null;
+      const playbackTransferMode = latest.project.preferences.playback_transfer_mode ?? "hybrid-preview";
+      const useDisplayPreviewForPlayback = latest.isPlaying && playbackTransferMode === "fast-display";
       const publishPartialFrame = (partialFrame: FloatViewerFrame) => {
-        if (controller.signal.aborted || latest.viewerCompareEnabled) return;
+        if (!isCurrentRequest() || latest.viewerCompareEnabled) return;
         if (!partialShaderRequested) {
           partialShaderRequested = true;
           void loadOcioGpuShader(partialFrame, controller.signal);
@@ -703,7 +808,7 @@ export default function App() {
         );
         payloadBytes = blob.size;
       } else {
-        if (isWebglFloatViewerSupported()) {
+        if (!useDisplayPreviewForPlayback && isWebglFloatViewerSupported()) {
           try {
             if (latest.viewerCompareEnabled) {
               const [frameA, frameB] = await Promise.all([
@@ -714,13 +819,15 @@ export default function App() {
               nextGpuCompareFrame = frameB.frame;
               payloadBytes = frameA.bytes + frameB.bytes;
               servedFromFrontendViewerCache = frameA.frontendCacheHit && frameB.frontendCacheHit;
+              clientFrameMetrics = combineFrameMetrics(frameA.frame.metrics, frameB.frame.metrics);
             } else {
               const frameData = await requestFloatFrame(null, publishPartialFrame);
               nextGpuFrame = frameData.frame;
               payloadBytes = frameData.bytes;
               servedFromFrontendViewerCache = frameData.frontendCacheHit;
+              clientFrameMetrics = frameData.frame.metrics ?? null;
             }
-            if (nextGpuFrame && !controller.signal.aborted) {
+            if (nextGpuFrame && isCurrentRequest()) {
               await loadOcioGpuShader(nextGpuFrame, controller.signal);
               frontendTransport = servedFromFrontendViewerCache ? "browser-float-cache" : viewerFrameTransport(nextGpuFrame);
             }
@@ -739,9 +846,13 @@ export default function App() {
           blob = cpuPreview.blob;
           compareBlob = cpuPreview.compareBlob;
           payloadBytes = blob.size + (compareBlob?.size ?? 0);
+          if (useDisplayPreviewForPlayback) {
+            frontendTransport = `display-preview-${playbackTransferMode}`;
+          }
         }
       }
       const frontendMs = performance.now() - frontendStarted;
+      if (!isCurrentRequest()) return false;
       const nextHistory = [...frontendTimingRef.current.history, frontendMs].slice(-30);
       frontendTimingRef.current = { lastMs: frontendMs, history: nextHistory };
       setFrontendFrameMs(frontendMs);
@@ -767,16 +878,21 @@ export default function App() {
             send_ms: 0,
             bytes: payloadBytes,
             frontend_cache_hit: servedFromFrontendViewerCache,
+            ws_wait_ms: clientFrameMetrics?.ws_wait_ms ?? 0,
+            receive_ms: clientFrameMetrics?.receive_ms ?? 0,
+            tile_copy_ms: clientFrameMetrics?.tile_copy_ms ?? 0,
+            browser_cache_hit_ms: clientFrameMetrics?.browser_cache_hit_ms ?? 0,
             timestamp: Date.now() / 1000,
           },
         ].slice(-80),
       );
-      if (controller.signal.aborted) return false;
+      if (!isCurrentRequest()) return false;
 
       const previousUrl = latestRef.current.viewerUrl;
       if (previousUrl) URL.revokeObjectURL(previousUrl);
       const previousCompareUrl = latestRef.current.compareViewerUrl;
       if (previousCompareUrl) URL.revokeObjectURL(previousCompareUrl);
+      lastCompletedAutoRefreshKeyRef.current = currentRenderKey(frameNumber);
       if (latestRef.current.frame !== frameNumber) setFrame(frameNumber);
       if (nextGpuFrame) {
         setViewerUrl(null);
@@ -794,11 +910,11 @@ export default function App() {
         setCompareViewerUrl(compareUrl);
       }
       if (servedFromFrontendViewerCache && nextGpuFrame) {
+        setCachedFrames(viewerReadyCachedFrames(frontendViewerCacheRef.current, latestRef.current, renderRevisionRef.current));
         refreshCacheStatusLabel();
       } else {
         await loadCacheStatus();
       }
-      lastCompletedAutoRefreshKeyRef.current = currentRenderKey(frameNumber);
       return true;
     },
     [addLog, currentRenderKey, loadCacheStatus, loadOcioGpuShader, refreshCacheStatusLabel, setFrame, setViewerUrl, syncGraphAndSettings],
@@ -839,12 +955,77 @@ export default function App() {
     [addLog, cancelIdlePrefetch, renderViewerFrame, setRendering],
   );
 
+  useEffect(() => {
+    if (!showViewerPanel || !project || !graph || isPlaying || isRendering || cryptoPreviewEnabled) return;
+    const viewerHasCompleteFrame = Boolean(viewerUrl || (viewerGpuFrame && !viewerGpuFrame.header.partial));
+    if (viewerHasCompleteFrame) {
+      firstVisibleFrameRequestRef.current = { key: "", attempts: 0 };
+      return;
+    }
+
+    const key = currentRenderKey();
+    const current = firstVisibleFrameRequestRef.current;
+    const attempts = current.key === key ? current.attempts : 0;
+    if (attempts >= 4) return;
+
+    const handle = window.setTimeout(() => {
+      const currentViewerComplete = Boolean(latestRef.current.viewerUrl || (viewerGpuFrame && !viewerGpuFrame.header.partial));
+      if (currentViewerComplete || latestRef.current.isPlaying) return;
+      firstVisibleFrameRequestRef.current = { key, attempts: attempts + 1 };
+      void refreshViewer(true);
+    }, attempts === 0 ? 80 : 400);
+    return () => window.clearTimeout(handle);
+  }, [
+    cryptoPreviewEnabled,
+    currentRenderKey,
+    graph,
+    isPlaying,
+    isRendering,
+    project,
+    refreshViewer,
+    showViewerPanel,
+    viewerGpuFrame,
+    viewerUrl,
+  ]);
+
+  const handleFrameChange = useCallback(
+    (nextFrame: number) => {
+      const current = latestRef.current;
+      const settings = current.project?.settings;
+      const normalized = settings ? clampFrame(nextFrame, settings.frame_start, settings.frame_end) : nextFrame;
+      cancelIdlePrefetch();
+      abortRef.current?.abort();
+      const controller = new AbortController();
+      abortRef.current = controller;
+      setFrame(normalized);
+      setRendering(true);
+      void renderViewerFrame(normalized, controller)
+        .catch((error) => {
+          if (error instanceof DOMException && error.name === "AbortError") return;
+          addLog("error", error instanceof Error ? error.message : String(error));
+        })
+        .finally(() => {
+          if (abortRef.current === controller) {
+            setRendering(false);
+          }
+        });
+    },
+    [addLog, cancelIdlePrefetch, renderViewerFrame, setFrame, setRendering],
+  );
+
   const runIdlePrefetch = useCallback(
     async (sessionId: number, anchorFrame: number, snapshot: typeof latestRef.current) => {
       if (!snapshot.graph || !snapshot.project || snapshot.cryptoPreviewEnabled || !isWebglFloatViewerSupported()) return;
       const settings = snapshot.project.settings;
+      if (
+        !settings.proxy_enabled &&
+        !viewerReadyCachedFrames(frontendViewerCacheRef.current, snapshot, renderRevisionRef.current).includes(anchorFrame)
+      ) {
+        return;
+      }
       const frames = idlePrefetchFrameOrder(anchorFrame, settings.frame_start, settings.frame_end);
       if (frames.length === 0) return;
+      scheduleReadPreload(frames, snapshot);
 
       const controller = new AbortController();
       idlePrefetchControllerRef.current = controller;
@@ -862,17 +1043,7 @@ export default function App() {
             await requestCachedFloatFrame(frameToWarm, null, controller.signal, snapshot);
           }
           await yieldToBrowser(controller.signal);
-          setCachedFrames(
-            mergeFrameLists(
-              lastCacheStatusRef.current?.cached_frames?.length
-                ? lastCacheStatusRef.current.cached_frames
-                : lastCacheStatusRef.current?.cached_all_frames ?? [],
-              frontendViewerCachedFrames(
-                frontendViewerCacheRef.current,
-                frontendCacheFrameContext(latestRef.current, renderRevisionRef.current),
-              ),
-            ),
-          );
+          setCachedFrames(viewerReadyCachedFrames(frontendViewerCacheRef.current, latestRef.current, renderRevisionRef.current));
           refreshCacheStatusLabel();
         }
       } catch (error) {
@@ -888,12 +1059,14 @@ export default function App() {
         }
       }
     },
-    [addLog, refreshCacheStatusLabel, requestCachedFloatFrame],
+    [addLog, refreshCacheStatusLabel, requestCachedFloatFrame, scheduleReadPreload],
   );
 
   useEffect(() => {
     cancelIdlePrefetch();
     if (!project || isPlaying || isRendering || cryptoPreviewEnabled || !project.settings.auto_refresh) return;
+    const activeViewerFrameReady = Boolean(viewerUrl || (viewerGpuFrame && !viewerGpuFrame.header.partial));
+    if (!activeViewerFrameReady) return;
     const sessionId = idlePrefetchSessionRef.current + 1;
     idlePrefetchSessionRef.current = sessionId;
     const snapshot = { ...latestRef.current };
@@ -924,19 +1097,50 @@ export default function App() {
     viewerCompareEnabled,
     viewerCompareInputA,
     viewerCompareInputB,
+    viewerGpuFrame,
+    viewerUrl,
+  ]);
+
+  useEffect(() => {
+    if (!project || isPlaying || cryptoPreviewEnabled || !project.settings.cache_enabled) return;
+    if (!project.preferences.read_preload_enabled) return;
+    const snapshot = { ...latestRef.current };
+    const maxFrames = Math.max(1, Math.round(project.preferences.read_preload_max_frames ?? 6));
+    const frames = readPreloadFrameOrder(frame, project.settings.frame_start, project.settings.frame_end, maxFrames);
+    const handle = window.setTimeout(() => scheduleReadPreload(frames, snapshot), 250);
+    return () => window.clearTimeout(handle);
+  }, [
+    cryptoPreviewEnabled,
+    frame,
+    isPlaying,
+    project,
+    project?.preferences.read_preload_enabled,
+    project?.preferences.read_preload_max_frames,
+    project?.settings.cache_enabled,
+    project?.settings.frame_start,
+    project?.settings.frame_end,
+    renderRevision,
+    scheduleReadPreload,
+    viewerChannel,
+    viewerCompareEnabled,
+    viewerCompareInputA,
+    viewerCompareInputB,
   ]);
 
   useEffect(() => {
     if (isPlaying) return;
+    if (isRendering) return;
     if (!project?.settings.auto_refresh || !latestRef.current.graph) return;
     if (skipNextAutoRefreshRef.current) {
       skipNextAutoRefreshRef.current = false;
       return;
     }
     const scheduledKey = currentRenderKey();
-    if (lastCompletedAutoRefreshKeyRef.current === scheduledKey) return;
+    const viewerHasCompleteFrame = Boolean(viewerUrl || (viewerGpuFrame && !viewerGpuFrame.header.partial));
+    if (lastCompletedAutoRefreshKeyRef.current === scheduledKey && viewerHasCompleteFrame) return;
     const handle = window.setTimeout(() => {
-      if (lastCompletedAutoRefreshKeyRef.current === scheduledKey) return;
+      const stillHasCompleteFrame = Boolean(latestRef.current.viewerUrl || (viewerGpuFrame && !viewerGpuFrame.header.partial));
+      if (lastCompletedAutoRefreshKeyRef.current === scheduledKey && stillHasCompleteFrame) return;
       void refreshViewer(true);
     }, 120);
     return () => window.clearTimeout(handle);
@@ -959,11 +1163,14 @@ export default function App() {
     viewerFstop,
     viewerGain,
     viewerSaturation,
+    viewerGpuFrame,
+    viewerUrl,
     cryptoLayer,
     cryptoPreviewEnabled,
     cryptoSelection,
     currentRenderKey,
     isPlaying,
+    isRendering,
     refreshViewer,
     renderRevision,
   ]);
@@ -983,6 +1190,49 @@ export default function App() {
     addLog("info", `Playback caching ${frameStart}-${frameEnd}.`);
 
     const nextFrame = (current: number) => (current >= frameEnd ? frameStart : current + 1);
+    const warmAhead = (frameToRender: number) => {
+      const latest = latestRef.current;
+      if (!latest.project || !latest.graph) return;
+      const frames = playbackAheadFrameOrder(
+        frameToRender,
+        frameStart,
+        frameEnd,
+        Math.max(2, Math.min((latest.project.settings.render_workers ?? 4) * 2, 12)),
+      ).filter((frameToWarm) => frameToWarm !== frameToRender);
+      if (frames.length === 0) return;
+      scheduleReadPreload([frameToRender, ...frames], latest);
+      const display = latest.project.settings.viewer_display;
+      const view = latest.project.settings.viewer_view;
+      const channel = latest.viewerChannel;
+      const inputs = latest.viewerCompareEnabled ? [latest.viewerCompareInputA, latest.viewerCompareInputB] : [null];
+      for (const viewerInput of inputs) {
+        void client
+          .warmViewerFrames(latest.viewerNodeId, frames, { viewerInput, display, view, channel })
+          .catch((error) => {
+            if (!(error instanceof DOMException && error.name === "AbortError")) {
+              addLog("error", `Backend warm failed: ${error instanceof Error ? error.message : String(error)}`);
+            }
+          });
+      }
+
+      const frontendFrameLimit = latest.project.settings.proxy_enabled
+        ? Math.max(2, Math.min(latest.project.settings.viewer_tile_lanes ?? 3, 6))
+        : 1;
+      for (const viewerInput of inputs) {
+        for (const frameToWarm of frames.slice(0, frontendFrameLimit)) {
+          void requestCachedFloatFrame(frameToWarm, viewerInput, controller.signal, latest)
+            .then(() => {
+              setCachedFrames(viewerReadyCachedFrames(frontendViewerCacheRef.current, latestRef.current, renderRevisionRef.current));
+              refreshCacheStatusLabel();
+            })
+            .catch((error) => {
+              if (!(error instanceof DOMException && error.name === "AbortError")) {
+                addLog("error", `Browser warm failed: ${error instanceof Error ? error.message : String(error)}`);
+              }
+            });
+        }
+      }
+    };
 
     async function playLoop() {
       let frameToRender = nextFrame(latestRef.current.frame);
@@ -990,6 +1240,7 @@ export default function App() {
         while (!cancelled && !controller.signal.aborted) {
           const started = performance.now();
           setPlaybackStatus(`caching F${frameToRender}`);
+          warmAhead(frameToRender);
           const rendered = await renderViewerFrame(frameToRender, controller);
           if (!rendered || cancelled || controller.signal.aborted) break;
 
@@ -1027,7 +1278,10 @@ export default function App() {
     cancelIdlePrefetch,
     isPlaying,
     project,
+    refreshCacheStatusLabel,
+    requestCachedFloatFrame,
     renderViewerFrame,
+    scheduleReadPreload,
     setPlaying,
     setRendering,
   ]);
@@ -1091,6 +1345,23 @@ export default function App() {
         return;
       }
       const hotkeys = project?.preferences.hotkeys;
+      if (matchesHotkey(event, hotkeys?.toggle_disable ?? "d")) {
+        event.preventDefault();
+        if (!selectedNode) {
+          addLog("error", "Select a node to disable.");
+          return;
+        }
+        const disabled = !isNodeDisabledParam(selectedNode.params);
+        updateNode({
+          ...selectedNode,
+          params: {
+            ...selectedNode.params,
+            disabled,
+          },
+        });
+        addLog("info", `${disabled ? "Disabled" : "Enabled"} ${selectedNode.id}.`);
+        return;
+      }
       const actions: Array<[string, string]> = [
         [hotkeys?.add_read ?? "r", "Read"],
         [hotkeys?.add_write ?? "w", "Write"],
@@ -1113,7 +1384,17 @@ export default function App() {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [addLog, addNode, deleteSelectedNode, lastGraphPosition, project?.preferences.hotkeys, refreshViewer, setViewerInput]);
+  }, [
+    addLog,
+    addNode,
+    deleteSelectedNode,
+    lastGraphPosition,
+    project?.preferences.hotkeys,
+    refreshViewer,
+    selectedNode,
+    setViewerInput,
+    updateNode,
+  ]);
 
   async function saveProject(pathOverride?: string | null) {
     const current = latestRef.current;
@@ -1218,7 +1499,7 @@ export default function App() {
     if (JSON.stringify(settings) !== JSON.stringify(loaded.settings)) {
       await client.putProjectSettings(settings);
     }
-    clearFrontendViewerCache(frontendViewerCacheRef.current);
+    resetFrontendViewerCache();
     setCachedFrames([]);
     setSelectedMetadata(null);
     setViewerMetadata(null);
@@ -1263,7 +1544,7 @@ export default function App() {
     try {
       cancelIdlePrefetch();
       await client.clearCache();
-      clearFrontendViewerCache(frontendViewerCacheRef.current);
+      resetFrontendViewerCache();
       setCachedFrames([]);
       refreshCacheStatusLabel();
       await loadCacheStatus();
@@ -1284,7 +1565,7 @@ export default function App() {
         viewer_view: newProject.settings.viewer_view ?? config.default_view,
       };
       await client.putProjectSettings(settings);
-      clearFrontendViewerCache(frontendViewerCacheRef.current);
+      resetFrontendViewerCache();
       setProject({ ...newProject, settings });
       await loadCacheStatus();
       addLog("info", "New reference sequence project loaded.");
@@ -1297,7 +1578,7 @@ export default function App() {
     try {
       cancelIdlePrefetch();
       const created = await client.createScript(`Comp ${(project?.script_tabs.length ?? 0) + 1}`);
-      clearFrontendViewerCache(frontendViewerCacheRef.current);
+      resetFrontendViewerCache();
       setProject(created);
       addLog("info", `Created script tab ${created.script_tabs.find((tab) => tab.id === created.active_script_id)?.name}.`);
     } catch (error) {
@@ -1310,7 +1591,7 @@ export default function App() {
       cancelIdlePrefetch();
       await syncGraphAndSettings();
       const activated = await client.setActiveScript(scriptId);
-      clearFrontendViewerCache(frontendViewerCacheRef.current);
+      resetFrontendViewerCache();
       setProject(activated);
       await loadCacheStatus();
       addLog("info", `Activated ${activated.script_tabs.find((tab) => tab.id === scriptId)?.name}.`);
@@ -1338,7 +1619,7 @@ export default function App() {
       const result = await client.runPython(scriptEditorCode);
       const nextFrame = clampFrame(frame, result.project.settings.frame_start, result.project.settings.frame_end);
       if (result.changed) {
-        clearFrontendViewerCache(frontendViewerCacheRef.current);
+        resetFrontendViewerCache();
       }
       setProject(result.project);
       setFrame(nextFrame);
@@ -1524,6 +1805,54 @@ export default function App() {
                   onChange={(event) => updatePreferences({ cache_memory_limit_mb: Number(event.target.value) })}
                 />
               </label>
+              <label className="toggle-label">
+                <input
+                  type="checkbox"
+                  checked={project.preferences.read_preload_enabled ?? true}
+                  onChange={(event) => updatePreferences({ read_preload_enabled: event.target.checked })}
+                />
+                Preload Reads
+              </label>
+              <label>
+                Read Preload Frames
+                <input
+                  type="number"
+                  min={1}
+                  value={project.preferences.read_preload_max_frames ?? 6}
+                  onChange={(event) => updatePreferences({ read_preload_max_frames: Number(event.target.value) })}
+                />
+              </label>
+              <label>
+                Playback Transfer
+                <select
+                  value={project.preferences.playback_transfer_mode}
+                  onChange={(event) =>
+                    updatePreferences({
+                      playback_transfer_mode: event.target.value as Project["preferences"]["playback_transfer_mode"],
+                    })
+                  }
+                >
+                  <option value="hybrid-preview">GPU Float + Cache</option>
+                  <option value="always-float">Always Float</option>
+                  <option value="fast-display">Fast Display PNG</option>
+                </select>
+              </label>
+              <label>
+                Viewer Precision
+                <select
+                  value={project.preferences.viewer_transfer_precision ?? "float16"}
+                  onChange={(event) =>
+                    updatePreferences({
+                      viewer_transfer_precision: event.target.value as Project["preferences"]["viewer_transfer_precision"],
+                    })
+                  }
+                >
+                  <option value="float32">Float 32</option>
+                  <option value="float16">Half Float 16</option>
+                  <option value="rgb10a2">10-bit Preview</option>
+                  <option value="uint8">8-bit Preview</option>
+                </select>
+              </label>
               <label>
                 Zoom Speed
                 <input
@@ -1582,6 +1911,15 @@ export default function App() {
                   value={project.preferences.hotkeys.add_group}
                   onChange={(event) =>
                     updatePreferences({ hotkeys: { ...project.preferences.hotkeys, add_group: event.target.value } })
+                  }
+                />
+              </label>
+              <label>
+                Disable Hotkey
+                <input
+                  value={project.preferences.hotkeys.toggle_disable ?? "d"}
+                  onChange={(event) =>
+                    updatePreferences({ hotkeys: { ...project.preferences.hotkeys, toggle_disable: event.target.value } })
                   }
                 />
               </label>
@@ -1736,7 +2074,7 @@ export default function App() {
               isRendering={isRendering}
               renderStatus={playbackStatus}
               onTogglePlayback={() => setPlaying(!isPlaying)}
-              onFrameChange={setFrame}
+              onFrameChange={handleFrameChange}
               onRefresh={() => void refreshViewer()}
               onDisplayChange={(display) => updateProjectSettings({ viewer_display: display, viewer_view: null }, false)}
               onViewChange={(view) => updateProjectSettings({ viewer_view: view }, false)}
@@ -1853,7 +2191,7 @@ function viewerFloatCacheKey(
   const settings = project.settings;
   return JSON.stringify({
     kind: "float-viewer",
-    transportPrecision: "float16",
+    transportPrecision: project.preferences.viewer_transfer_precision ?? "float16",
     transportTiles: true,
     renderRevision,
     scriptId: project.active_script_id,
@@ -1865,6 +2203,15 @@ function viewerFloatCacheKey(
     ocioConfig: settings.ocio_config ?? "",
     workingColorspace: settings.working_colorspace,
   });
+}
+
+function transferModeForPrecision(
+  precision: Project["preferences"]["viewer_transfer_precision"],
+): NonNullable<Parameters<typeof client.viewerFloatFrameStream>[6]>["transferMode"] {
+  if (precision === "float32") return "float32-rgba";
+  if (precision === "rgb10a2") return "rgb10a2";
+  if (precision === "uint8") return "uint8-rgba";
+  return "float16-rgba";
 }
 
 function frontendCacheFrameContext(
@@ -1973,6 +2320,21 @@ function viewerFrameTransport(frame: FloatViewerFrame) {
   return `webgl-${frame.header.dtype}${frame.header.tile_stream ? "-tiles" : ""}`;
 }
 
+function combineFrameMetrics(
+  a: FloatViewerFrame["metrics"] | null | undefined,
+  b: FloatViewerFrame["metrics"] | null | undefined,
+) {
+  if (!a) return b ?? null;
+  if (!b) return a;
+  return {
+    ws_wait_ms: Math.max(a.ws_wait_ms, b.ws_wait_ms),
+    receive_ms: a.receive_ms + b.receive_ms,
+    tile_copy_ms: a.tile_copy_ms + b.tile_copy_ms,
+    browser_cache_hit_ms: a.browser_cache_hit_ms + b.browser_cache_hit_ms,
+    bytes: a.bytes + b.bytes,
+  };
+}
+
 function activeViewerInput(graph: ProjectGraph | null, viewerNodeId: string) {
   const viewer = graph?.nodes[viewerNodeId];
   if (!viewer || viewer.type.toLowerCase() !== "viewer") return null;
@@ -2062,11 +2424,15 @@ function frontendViewerCachedFrames(
       continue;
     }
   }
-  return [...frames];
+  return [...frames].sort((left, right) => left - right);
 }
 
-function mergeFrameLists(a: number[], b: number[]) {
-  return [...new Set([...a, ...b])].sort((left, right) => left - right);
+function viewerReadyCachedFrames(
+  cache: FrontendViewerCacheState,
+  snapshot: { graph: ProjectGraph | null; project: Project | null; viewerNodeId: string; viewerChannel: string },
+  renderRevision: number,
+) {
+  return frontendViewerCachedFrames(cache, frontendCacheFrameContext(snapshot, renderRevision));
 }
 
 function idlePrefetchFrameOrder(anchor: number, frameStart: number, frameEnd: number) {
@@ -2080,6 +2446,36 @@ function idlePrefetchFrameOrder(anchor: number, frameStart: number, frameEnd: nu
     if (forward <= end) frames.push(forward);
     if (backward >= start) frames.push(backward);
     if (forward > end && backward < start) break;
+  }
+  return frames;
+}
+
+function readPreloadFrameOrder(anchor: number, frameStart: number, frameEnd: number, maxFrames: number) {
+  const start = Math.min(frameStart, frameEnd);
+  const end = Math.max(frameStart, frameEnd);
+  const center = clampFrame(anchor, start, end);
+  const frames = [center];
+  for (let offset = 1; frames.length < maxFrames; offset += 1) {
+    const forward = center + offset;
+    const backward = center - offset;
+    if (forward <= end) frames.push(forward);
+    if (frames.length >= maxFrames) break;
+    if (backward >= start) frames.push(backward);
+    if (forward > end && backward < start) break;
+  }
+  return frames.slice(0, maxFrames);
+}
+
+function playbackAheadFrameOrder(anchor: number, frameStart: number, frameEnd: number, count: number) {
+  const start = Math.min(frameStart, frameEnd);
+  const end = Math.max(frameStart, frameEnd);
+  const frames: number[] = [];
+  let current = clampFrame(anchor, start, end);
+  while (frames.length < count && end >= start) {
+    current = current >= end ? start : current + 1;
+    if (current === anchor && frames.length > 0) break;
+    frames.push(current);
+    if (end === start) break;
   }
   return frames;
 }
@@ -2101,6 +2497,10 @@ function yieldToBrowser(signal: AbortSignal) {
     };
     signal.addEventListener("abort", onAbort, { once: true });
   });
+}
+
+function sleep(ms: number) {
+  return new Promise<void>((resolve) => window.setTimeout(resolve, ms));
 }
 
 function isEditableTarget(target: EventTarget | null) {
@@ -2130,6 +2530,16 @@ function matchesHotkey(event: KeyboardEvent, shortcut: string) {
     event.shiftKey === wantsShift &&
     event.altKey === wantsAlt
   );
+}
+
+function isNodeDisabledParam(params: Record<string, unknown>) {
+  const value = params.disabled ?? params.disable ?? false;
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  if (typeof value === "string") {
+    return ["1", "true", "yes", "on", "disabled", "disable"].includes(value.trim().toLowerCase());
+  }
+  return Boolean(value);
 }
 
 function formatBytes(bytes: number) {

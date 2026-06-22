@@ -89,6 +89,84 @@ def test_viewer_float_websocket_can_stream_float16_tiles() -> None:
     assert received == header["byte_length"]
 
 
+def test_viewer_float_websocket_can_stream_one_tile_lane() -> None:
+    client = TestClient(app)
+    _install_gradient_viewer(client)
+
+    with client.websocket_connect("/ws/viewer/float") as websocket:
+        websocket.send_json(
+            {
+                "node_id": "Viewer1",
+                "frame": 1001,
+                "viewer_input": "0",
+                "channel": "rgba",
+                "precision": "float16",
+                "stream_tiles": True,
+                "tile_height": 7,
+                "tile_lanes": 3,
+                "tile_lane": 1,
+            }
+        )
+        header = json.loads(websocket.receive_text())
+        received = 0
+        tile_count = 0
+        while True:
+            message = json.loads(websocket.receive_text())
+            if message["type"] == "viewer_float_tiles_done":
+                assert message["tiles"] == tile_count
+                break
+            assert message["type"] == "viewer_float_tile"
+            data = websocket.receive_bytes()
+            assert len(data) == message["byte_length"]
+            received += len(data)
+            tile_count += 1
+
+    assert header["tile_lanes"] == 3
+    assert header["tile_lane"] == 1
+    assert header["tile_count"] == tile_count
+    assert header["tile_count_total"] > header["tile_count"]
+    assert received < header["byte_length"]
+
+
+def test_viewer_float_websocket_uses_native_tiles_when_proxy_is_off() -> None:
+    client = TestClient(app)
+    _install_gradient_viewer(client)
+    settings = client.get("/api/projects/settings").json()
+    settings["proxy_enabled"] = False
+    response = client.put("/api/projects/settings", json={"settings": settings})
+    assert response.status_code == 200
+
+    with client.websocket_connect("/ws/viewer/float") as websocket:
+        websocket.send_json(
+            {
+                "node_id": "Viewer1",
+                "frame": 1001,
+                "viewer_input": "0",
+                "channel": "rgba",
+                "precision": "float16",
+                "stream_tiles": True,
+                "tile_height": 64,
+            }
+        )
+        header = json.loads(websocket.receive_text())
+        tile_message = None
+        tile_data = b""
+        while True:
+            message = json.loads(websocket.receive_text())
+            if message["type"] == "viewer_float_tiles_done":
+                break
+            if tile_message is None:
+                tile_message = message
+                tile_data = websocket.receive_bytes()
+            else:
+                websocket.receive_bytes()
+
+    assert header["tile_native"] is True
+    assert tile_message is not None
+    assert tile_message["type"] == "viewer_float_tile"
+    assert len(tile_data) == tile_message["byte_length"]
+
+
 def test_color_gpu_shader_endpoint_reports_capability() -> None:
     client = TestClient(app)
     client.post("/api/projects/new")

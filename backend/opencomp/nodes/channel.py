@@ -502,6 +502,11 @@ def _get_plane(frame: ImageFrame, channel: str) -> np.ndarray:
         return (frame.data[:, :, 0] * 0.2126 + frame.data[:, :, 1] * 0.7152 + frame.data[:, :, 2] * 0.0722).astype(
             np.float32
         )
+    if normalized not in MAIN_COMPONENTS and "." not in normalized:
+        direct_key = _case_insensitive_key(frame.channel_data, channel)
+        if direct_key:
+            value = frame.channel_data[direct_key]
+            return value[:, :, 0] if value.ndim == 3 else value
 
     layer, component = _split_channel_ref(channel)
     if layer == "rgba":

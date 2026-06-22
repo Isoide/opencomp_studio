@@ -255,6 +255,7 @@ function draw(
     const [x, y] = node.position;
     const selected = node.id === selectedNodeId;
     const active = activeNodeIds.has(node.id);
+    const disabled = isNodeDisabled(node);
     const timing = nodeTimings[node.id];
     if (active) {
       ctx.save();
@@ -266,14 +267,16 @@ function draw(
       ctx.stroke();
       ctx.restore();
     }
-    ctx.fillStyle = selected ? "#2b4f4a" : "#242424";
+    ctx.fillStyle = disabled ? "#1f1f1f" : selected ? "#2b4f4a" : "#242424";
     roundRect(ctx, x, y, NODE_W, NODE_H, 8);
     ctx.fill();
-    ctx.strokeStyle = selected ? "#5ed0bb" : "#57534a";
+    ctx.strokeStyle = disabled ? "#8d8070" : selected ? "#5ed0bb" : "#57534a";
     ctx.lineWidth = (selected ? 2 : 1) / viewport.scale;
+    if (disabled) ctx.setLineDash([4 / viewport.scale, 3 / viewport.scale]);
     ctx.stroke();
+    ctx.setLineDash([]);
 
-    ctx.fillStyle = nodeColor(node.type);
+    ctx.fillStyle = disabled ? "#3e3a34" : nodeColor(node.type);
     roundRect(ctx, x, y, NODE_W, 18, 8);
     ctx.fill();
     ctx.fillStyle = "#f6f1e5";
@@ -282,7 +285,18 @@ function draw(
     ctx.fillStyle = "#cfc7b5";
     ctx.font = "11px Segoe UI, sans-serif";
     const detail = node.type.toLowerCase() === "viewer" ? `input ${String(node.params.active_input ?? "0")}` : node.id;
-    ctx.fillText(detail, x + 10, y + 38);
+    ctx.fillText(disabled ? `disabled -> ${bypassLabel(node)}` : detail, x + 10, y + 38);
+    if (disabled) {
+      ctx.save();
+      ctx.strokeStyle = "#b29b72";
+      ctx.globalAlpha = 0.62;
+      ctx.lineWidth = 1 / viewport.scale;
+      ctx.beginPath();
+      ctx.moveTo(x + 10, y + NODE_H - 8);
+      ctx.lineTo(x + NODE_W - 10, y + 24);
+      ctx.stroke();
+      ctx.restore();
+    }
     if (timing && !active) {
       const ageSeconds = Date.now() / 1000 - timing.timestamp;
       if (ageSeconds < 8) {
@@ -349,6 +363,24 @@ function inputSockets(node: NodeModel): string[] {
   if (normalized === "merge" || normalized === "channelmerge") return ["a", "b", "mask"];
   if (normalized === "copy" || normalized === "shuffle" || normalized === "comparemetadata" || normalized === "copymetadata") return ["a", "b"];
   return [defaultInputSocket(node.type)];
+}
+
+function isNodeDisabled(node: NodeModel): boolean {
+  const value = node.params.disabled ?? node.params.disable ?? false;
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  if (typeof value === "string") {
+    return ["1", "true", "yes", "on", "disabled", "disable"].includes(value.trim().toLowerCase());
+  }
+  return Boolean(value);
+}
+
+function bypassLabel(node: NodeModel): string {
+  const sockets = inputSockets(node);
+  if (sockets.length === 0) return "source";
+  if (sockets.includes("a")) return "a";
+  if (sockets.includes("in")) return "in";
+  return sockets[0];
 }
 
 function defaultInputSocket(type: string) {

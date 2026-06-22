@@ -42,7 +42,7 @@ Each frame contains:
 - `format_bbox`: visible format box.
 - `data_window`: active EXR/data window box.
 
-All node processing is scene-linear float unless a node explicitly performs a color transform. The browser delivery format can be PNG or float16/float32 WebSocket data, but the graph cache itself stores float frames.
+All node processing is scene-linear float unless a node explicitly performs a color transform. The backend graph cache stores float32 frames. The browser delivery format can be PNG, float32, float16, packed RGB10A2, or 8-bit RGBA WebSocket data depending on viewer preferences.
 
 ## File I/O
 
@@ -91,6 +91,8 @@ Read parameters:
 - `read_channels`
 - `missing_frames`
 
+By default, EXR Reads now use smart channel demand: RGBA is loaded first, and extra AOVs are loaded only when the evaluated node tree references them or when the viewer requests a channel on demand. Set `read_all_channels=True` or `read_channels="all"` only when a script truly needs every layer in memory.
+
 ### Writes
 
 Write node evaluation is implemented by `backend/opencomp/nodes/write.py` and `backend/opencomp/io/image_writer.py`.
@@ -110,7 +112,7 @@ Write supports:
 - directory creation
 - limited frame range
 
-Current limitation: writing all auxiliary channels depends on `ImageFrame.channel_data` being present. If a Read node was optimized with `read_all_channels=False`, extra AOV pixel data is not loaded and therefore cannot be written back as full AOV data unless loaded upstream.
+Current limitation: writing all auxiliary channels depends on `ImageFrame.channel_data` being present. With smart Reads, extra AOV pixel data is not loaded unless the graph/viewer demands it, so all-layer writes must explicitly request those layers or enable full channel loading upstream.
 
 ## Color Pipeline and OCIO
 
@@ -131,7 +133,7 @@ Scene-linear viewer processing:
 2. Backend extracts the requested channel into float RGBA.
 3. Backend proxy-resizes if proxy mode is enabled.
 4. Backend stores that pre-display float buffer in the float preview cache.
-5. Frontend receives float16 or float32 RGBA.
+5. Frontend receives float32, float16, RGB10A2, or 8-bit RGBA depending on the Viewer Precision preference.
 6. Frontend WebGL applies viewer gain/saturation/f-stop and OCIO display shader.
 7. Browser displays the final monitor image.
 
@@ -275,7 +277,7 @@ Preferred path:
 
 1. Frontend calls `/ws/viewer/float`.
 2. Backend returns a JSON frame header.
-3. Backend streams full-width row tiles as binary float16 or float32.
+3. Backend streams full-width row tiles as binary float32, float16, RGB10A2, or 8-bit RGBA.
 4. Frontend assembles the float buffer.
 5. Frontend stores it in the browser viewer cache.
 6. WebGL2 uploads the float frame to a texture.
@@ -287,7 +289,7 @@ Preferred path:
    - OCIO GPU display shader if available
 8. Viewer canvas displays the result.
 
-Default transport is float16 tiled streaming.
+Default transport is float16 tiled streaming. Float32 preserves the most viewer precision, float16 is the normal scene-linear performance mode, and RGB10A2/8-bit are smaller preview modes that clamp and quantize the viewer stream.
 
 ### CPU PNG Fallback
 

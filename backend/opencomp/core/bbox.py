@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 
 BBox = dict[str, int]
@@ -54,6 +55,40 @@ def transform_bbox(
     }
 
 
+def affine_bbox(
+    box: Mapping[str, object] | None,
+    matrix: tuple[float, float, float, float, float, float],
+    source_width: int,
+    source_height: int,
+) -> BBox:
+    source = normalize_bbox(box, source_width, source_height)
+    x0 = float(source["x"])
+    y0 = float(source["y"])
+    x1 = x0 + float(source["width"])
+    y1 = y0 + float(source["height"])
+    points = [
+        _apply_affine(matrix, x0, y0),
+        _apply_affine(matrix, x1, y0),
+        _apply_affine(matrix, x1, y1),
+        _apply_affine(matrix, x0, y1),
+    ]
+    min_x = math.floor(min(point[0] for point in points))
+    min_y = math.floor(min(point[1] for point in points))
+    max_x = math.ceil(max(point[0] for point in points))
+    max_y = math.ceil(max(point[1] for point in points))
+    return {"x": min_x, "y": min_y, "width": max(0, max_x - min_x), "height": max(0, max_y - min_y)}
+
+
+def translate_bbox(box: Mapping[str, object] | None, offset_x: int, offset_y: int, width: int, height: int) -> BBox:
+    source = normalize_bbox(box, width, height)
+    return {
+        "x": source["x"] + int(offset_x),
+        "y": source["y"] + int(offset_y),
+        "width": source["width"],
+        "height": source["height"],
+    }
+
+
 def union_bbox(*boxes: Mapping[str, object] | None) -> BBox:
     normalized = [normalize_bbox(box, 0, 0) for box in boxes if box is not None]
     if not normalized:
@@ -78,3 +113,8 @@ def intersect_bbox(*boxes: Mapping[str, object] | None) -> BBox:
 
 def bbox_equal(a: Mapping[str, object] | None, b: Mapping[str, object] | None) -> bool:
     return normalize_bbox(a, 0, 0) == normalize_bbox(b, 0, 0)
+
+
+def _apply_affine(matrix: tuple[float, float, float, float, float, float], x: float, y: float) -> tuple[float, float]:
+    a, b, c, d, e, f = matrix
+    return (a * x + b * y + c, d * x + e * y + f)

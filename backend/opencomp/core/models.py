@@ -65,6 +65,9 @@ class ProjectSettings(BaseModel):
     tile_rendering_enabled: bool = True
     tile_height: int = 64
     tile_workers: int = 4
+    render_workers: int = 4
+    read_workers: int = 4
+    viewer_tile_lanes: int = 3
 
 
 class HotkeyPreferences(BaseModel):
@@ -73,6 +76,7 @@ class HotkeyPreferences(BaseModel):
     add_merge: str = "m"
     add_shuffle: str = "s"
     add_group: str = "g"
+    toggle_disable: str = "d"
     refresh_viewer: str = "u"
     fit_viewer: str = "f"
 
@@ -89,6 +93,10 @@ class ProjectPreferences(BaseModel):
     viewer_zoom_speed: float = 1.1
     wheel_zoom_enabled: bool = True
     auto_connect_new_nodes: bool = True
+    playback_transfer_mode: Literal["hybrid-preview", "always-float", "fast-display"] = "hybrid-preview"
+    viewer_transfer_precision: Literal["float32", "float16", "rgb10a2", "uint8"] = "float16"
+    read_preload_enabled: bool = True
+    read_preload_max_frames: int = 6
     default_read_colorspace: str = "ACES2065-1"
     custom_init_scripts: list[str] = Field(default_factory=list)
     path_substitutions: list[PathSubstitution] = Field(default_factory=list)
@@ -150,6 +158,28 @@ class ImageFrame:
         return {name: value.copy() for name, value in self.channel_data.items()}
 
 
+@dataclass(frozen=True, slots=True)
+class TileWindow:
+    x: int
+    y: int
+    width: int
+    height: int
+
+
+class ViewerViewport(BaseModel):
+    x: float = 0.0
+    y: float = 0.0
+    width: float = 0.0
+    height: float = 0.0
+
+
+class FrameROI(BaseModel):
+    x: int = 0
+    y: int = 0
+    width: int = 0
+    height: int = 0
+
+
 class FrameRequest(BaseModel):
     node_id: str
     frame: int = 1001
@@ -162,9 +192,49 @@ class FrameRequest(BaseModel):
     gain: float = 1.0
     saturation: float = 1.0
     fstop: float = 0.0
-    precision: Literal["float32", "float16"] = "float32"
+    precision: Literal["float32", "float16", "rgb10a2", "uint8"] = "float32"
     stream_tiles: bool = False
+    transfer_mode: Literal[
+        "float32-rgba",
+        "float16-rgba",
+        "float16-rgb",
+        "single-channel-float16",
+        "rgb10a2",
+        "uint8-rgba",
+        "display-preview",
+    ] = "float16-rgba"
+    viewport: ViewerViewport | None = None
+    zoom: float | None = None
+    tile_width: int | None = None
     tile_height: int | None = None
+    tile_lanes: int | None = None
+    tile_lane: int | None = None
+    request_id: str | None = None
+    roi: FrameROI | None = None
+    render_scale: float = 1.0
+    mipmap_level: int = 0
+    channels: list[str] = Field(default_factory=list)
+    layers: list[str] = Field(default_factory=list)
+    storage: Literal["ram", "gpu", "frontend", "disk"] = "frontend"
+    priority: Literal["interactive", "playback", "background", "render"] = "interactive"
+    cache_policy: Literal["read-through", "refresh", "bypass", "write-through"] = "read-through"
+    cancel_before: str | None = None
+
+
+class ViewerWarmRequest(BaseModel):
+    node_id: str
+    frames: list[int] = Field(default_factory=list)
+    viewer_input: str | None = None
+    display: str | None = None
+    view: str | None = None
+    channel: str | None = None
+
+
+class ReadWarmRequest(BaseModel):
+    node_id: str
+    frames: list[int] = Field(default_factory=list)
+    viewer_input: str | None = None
+    channel: str | None = None
 
 
 class CryptomattePickRequest(BaseModel):

@@ -133,7 +133,7 @@ For EXR, Read parses:
 - data window
 - display window
 
-Use `read_all_channels=False` for faster RGBA slapcomps. Use full channel loading for Cryptomatte or AOV-heavy workflows.
+Default Read behavior is smart channel demand: RGBA is loaded for normal slapcomps, and extra AOVs are loaded when a downstream node or the viewer asks for them. Use `read_all_channels=True` or `read_channels="all"` for workflows that intentionally need every layer loaded immediately.
 
 ### Write
 

@@ -67,6 +67,10 @@ export class WebglFloatViewerRenderer {
   private frameBData: FloatViewerPixels | null = null;
   private frameARevision = -1;
   private frameBRevision = -1;
+  private frameAPartial = false;
+  private frameBPartial = false;
+  private frameAStorageKey = "";
+  private frameBStorageKey = "";
   private ocioTextureKey = "";
   private ocioTextures = new Map<string, WebGLTexture>();
 
@@ -201,6 +205,10 @@ export class WebglFloatViewerRenderer {
     this.frameBData = null;
     this.frameARevision = -1;
     this.frameBRevision = -1;
+    this.frameAPartial = false;
+    this.frameBPartial = false;
+    this.frameAStorageKey = "";
+    this.frameBStorageKey = "";
     this.ocioTextureKey = "";
     this.ocioTextures.clear();
   }
@@ -269,8 +277,11 @@ export class WebglFloatViewerRenderer {
     const gl = this.gl;
     const currentData = slot === "a" ? this.frameAData : this.frameBData;
     const currentRevision = slot === "a" ? this.frameARevision : this.frameBRevision;
+    const currentPartial = slot === "a" ? this.frameAPartial : this.frameBPartial;
+    const currentStorageKey = slot === "a" ? this.frameAStorageKey : this.frameBStorageKey;
     const nextRevision = frame.header.tile_revision ?? 0;
-    if (currentData === frame.pixels && currentRevision === nextRevision) return 0;
+    const nextPartial = Boolean(frame.header.partial);
+    if (currentData === frame.pixels && currentRevision === nextRevision && currentPartial === nextPartial) return 0;
 
     let texture = slot === "a" ? this.frameATexture : this.frameBTexture;
     if (!texture) {
@@ -281,25 +292,63 @@ export class WebglFloatViewerRenderer {
     }
     gl.bindTexture(gl.TEXTURE_2D, texture);
     setTextureParameters(gl);
-    gl.texImage2D(
-      gl.TEXTURE_2D,
-      0,
-      frame.header.dtype === "float16" ? gl.RGBA16F : gl.RGBA32F,
-      frame.header.width,
-      frame.header.height,
-      0,
-      gl.RGBA,
-      frame.header.dtype === "float16" ? gl.HALF_FLOAT : gl.FLOAT,
-      frame.pixels,
-    );
+    const storageKey = `${frame.header.width}x${frame.header.height}:${frame.header.dtype}`;
+    const textureFormat = textureFormatForFrame(gl, frame);
+    const resetStorage = currentStorageKey !== storageKey || currentData !== frame.pixels;
+    if (resetStorage) {
+      gl.texImage2D(
+        gl.TEXTURE_2D,
+        0,
+        textureFormat.internalFormat,
+        frame.header.width,
+        frame.header.height,
+        0,
+        gl.RGBA,
+        textureFormat.pixelType,
+        null,
+      );
+    }
+    const updatedTile = frame.header.partial ? frame.header.updated_tile : null;
+    let uploadedBytes = frame.header.byte_length;
+    if (updatedTile) {
+      const tilePixels = tilePixelView(frame, updatedTile);
+      gl.texSubImage2D(
+        gl.TEXTURE_2D,
+        0,
+        updatedTile.x,
+        updatedTile.y,
+        updatedTile.width,
+        updatedTile.height,
+        gl.RGBA,
+        textureFormat.pixelType,
+        tilePixels,
+      );
+      uploadedBytes = encodedByteLength(updatedTile.width, updatedTile.height, frame.header.dtype);
+    } else {
+      gl.texSubImage2D(
+        gl.TEXTURE_2D,
+        0,
+        0,
+        0,
+        frame.header.width,
+        frame.header.height,
+        gl.RGBA,
+        textureFormat.pixelType,
+        frame.pixels,
+      );
+    }
     if (slot === "a") {
       this.frameAData = frame.pixels;
       this.frameARevision = nextRevision;
+      this.frameAPartial = nextPartial;
+      this.frameAStorageKey = storageKey;
     } else {
       this.frameBData = frame.pixels;
       this.frameBRevision = nextRevision;
+      this.frameBPartial = nextPartial;
+      this.frameBStorageKey = storageKey;
     }
-    return frame.header.byte_length;
+    return uploadedBytes;
   }
 
   private uploadOcioTextures(shader: OcioGpuShader | null | undefined) {
@@ -632,6 +681,70 @@ function setTextureParameters(gl: WebGL2RenderingContext) {
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+}
+
+function tilePixelView(
+  frame: FloatViewerFrame,
+  tile: { x: number; y: number; width: number; height: number },
+): FloatViewerPixels {
+  const elementsPerPixel = frame.header.dtype === "rgb10a2" ? 1 : 4;
+  const rowStride = frame.header.width * elementsPerPixel;
+  const tileStride = tile.width * elementsPerPixel;
+  const sourceOffset = tile.y * rowStride + tile.x * elementsPerPixel;
+  if (tile.x === 0 && tile.width === frame.header.width) {
+    return frame.pixels.subarray(sourceOffset, sourceOffset + tile.height * rowStride);
+  }
+
+  if (frame.pixels instanceof Float32Array) {
+    const output = new Float32Array(tile.height * tileStride);
+    for (let row = 0; row < tile.height; row += 1) {
+      const sourceStart = sourceOffset + row * rowStride;
+      output.set(frame.pixels.subarray(sourceStart, sourceStart + tileStride), row * tileStride);
+    }
+    return output;
+  }
+  if (frame.pixels instanceof Uint8Array) {
+    const output = new Uint8Array(tile.height * tileStride);
+    for (let row = 0; row < tile.height; row += 1) {
+      const sourceStart = sourceOffset + row * rowStride;
+      output.set(frame.pixels.subarray(sourceStart, sourceStart + tileStride), row * tileStride);
+    }
+    return output;
+  }
+  if (frame.pixels instanceof Uint32Array) {
+    const output = new Uint32Array(tile.height * tileStride);
+    for (let row = 0; row < tile.height; row += 1) {
+      const sourceStart = sourceOffset + row * rowStride;
+      output.set(frame.pixels.subarray(sourceStart, sourceStart + tileStride), row * tileStride);
+    }
+    return output;
+  }
+
+  const output = new Uint16Array(tile.height * tileStride);
+  for (let row = 0; row < tile.height; row += 1) {
+    const sourceStart = sourceOffset + row * rowStride;
+    output.set(frame.pixels.subarray(sourceStart, sourceStart + tileStride), row * tileStride);
+  }
+  return output;
+}
+
+function textureFormatForFrame(gl: WebGL2RenderingContext, frame: FloatViewerFrame) {
+  if (frame.header.dtype === "float16") {
+    return { internalFormat: gl.RGBA16F, pixelType: gl.HALF_FLOAT };
+  }
+  if (frame.header.dtype === "uint8") {
+    return { internalFormat: gl.RGBA8, pixelType: gl.UNSIGNED_BYTE };
+  }
+  if (frame.header.dtype === "rgb10a2") {
+    return { internalFormat: gl.RGB10_A2, pixelType: gl.UNSIGNED_INT_2_10_10_10_REV };
+  }
+  return { internalFormat: gl.RGBA32F, pixelType: gl.FLOAT };
+}
+
+function encodedByteLength(width: number, height: number, dtype: FloatViewerFrame["header"]["dtype"]) {
+  if (dtype === "float32") return width * height * 16;
+  if (dtype === "float16") return width * height * 8;
+  return width * height * 4;
 }
 
 function roundMs(value: number) {

@@ -39,7 +39,22 @@ class ViewerProcess:
     fstop: float = 0.0
 
 
+@dataclass(frozen=True, slots=True)
+class FloatPreviewResult:
+    entry: FloatPreviewCacheEntry
+    cache_hit: bool
+    lookup_ms: float
+    evaluate_ms: float
+    resize_ms: float
+
+
 def render_standard_preview(evaluator: GraphEvaluator, graph: ProjectGraph, request: PreviewRequest) -> bytes:
+    demand = evaluator.channel_demand_for(graph, request.eval_node_id, request.channel)
+    with evaluator.channel_demand_scope(demand):
+        return _render_standard_preview_scoped(evaluator, graph, request)
+
+
+def _render_standard_preview_scoped(evaluator: GraphEvaluator, graph: ProjectGraph, request: PreviewRequest) -> bytes:
     node = graph.nodes[request.cache_node_id]
     request_started = time.perf_counter()
     process = _normalized_viewer_process(request.viewer_process)
@@ -71,15 +86,20 @@ def render_standard_preview(evaluator: GraphEvaluator, graph: ProjectGraph, requ
         )
         return cached_preview
 
-    float_preview, float_hit, evaluate_ms, resize_ms = get_float_preview(evaluator, graph, request)
+    float_result = get_float_preview(evaluator, graph, request)
+    float_preview = float_result.entry
+    float_hit = float_result.cache_hit
+    evaluate_ms = float_result.evaluate_ms
+    resize_ms = float_result.resize_ms
     evaluator.record_phase_timing(
         request.cache_node_id,
         "viewer.float_cache",
-        evaluate_ms + resize_ms,
+        float_result.lookup_ms + evaluate_ms + resize_ms,
         {
             "frame": request.frame,
             "channel": request.channel or "rgba",
             "hit": float_hit,
+            "lookup_ms": round(float_result.lookup_ms, 2),
             "evaluate_ms": round(evaluate_ms, 2),
             "resize_ms": round(resize_ms, 2),
         },
@@ -153,13 +173,25 @@ def render_difference_preview(
     request_a: PreviewRequest,
     request_b: PreviewRequest,
 ) -> bytes:
+    demand_a = evaluator.channel_demand_for(graph, request_a.eval_node_id, request_a.channel)
+    demand_b = evaluator.channel_demand_for(graph, request_b.eval_node_id, request_b.channel)
+    with evaluator.channel_demand_scope(demand_a):
+        output_a = request_a.output_signature or evaluator.output_signature(graph, request_a.cache_node_id, request_a.frame)
+    with evaluator.channel_demand_scope(demand_b):
+        output_b = request_b.output_signature or evaluator.output_signature(graph, request_b.cache_node_id, request_b.frame)
+    return _render_difference_preview_scoped(evaluator, graph, request_a, request_b, _combined_signature(output_a, output_b))
+
+
+def _render_difference_preview_scoped(
+    evaluator: GraphEvaluator,
+    graph: ProjectGraph,
+    request_a: PreviewRequest,
+    request_b: PreviewRequest,
+    output_signature: str,
+) -> bytes:
     node = graph.nodes[request_a.cache_node_id]
     request_started = time.perf_counter()
     process = _normalized_viewer_process(request_a.viewer_process)
-    output_signature = _combined_signature(
-        request_a.output_signature or evaluator.output_signature(graph, request_a.cache_node_id, request_a.frame),
-        request_b.output_signature or evaluator.output_signature(graph, request_b.cache_node_id, request_b.frame),
-    )
     preview_key = evaluator.preview_cache_key_for_signature(
         request_a.cache_node_id,
         request_a.frame,
@@ -183,17 +215,30 @@ def render_difference_preview(
         evaluator.record_preview_timing(request_a.cache_node_id, _cached_timing("difference", len(cached_preview)))
         return cached_preview
 
-    float_a, hit_a, eval_a_ms, resize_a_ms = get_float_preview(evaluator, graph, request_a)
-    float_b, hit_b, eval_b_ms, resize_b_ms = get_float_preview(evaluator, graph, request_b)
+    result_a = get_float_preview(evaluator, graph, request_a)
+    result_b = get_float_preview(evaluator, graph, request_b)
+    float_a, hit_a, eval_a_ms, resize_a_ms = (
+        result_a.entry,
+        result_a.cache_hit,
+        result_a.evaluate_ms,
+        result_a.resize_ms,
+    )
+    float_b, hit_b, eval_b_ms, resize_b_ms = (
+        result_b.entry,
+        result_b.cache_hit,
+        result_b.evaluate_ms,
+        result_b.resize_ms,
+    )
     evaluator.record_phase_timing(
         request_a.cache_node_id,
         "viewer.float_cache",
-        eval_a_ms + eval_b_ms + resize_a_ms + resize_b_ms,
+        result_a.lookup_ms + result_b.lookup_ms + eval_a_ms + eval_b_ms + resize_a_ms + resize_b_ms,
         {
             "frame": request_a.frame,
             "channel": request_a.channel or "rgba",
             "hit": hit_a and hit_b,
             "mode": "difference",
+            "lookup_ms": round(result_a.lookup_ms + result_b.lookup_ms, 2),
             "evaluate_ms": round(eval_a_ms + eval_b_ms, 2),
             "resize_ms": round(resize_a_ms + resize_b_ms, 2),
         },
@@ -263,40 +308,44 @@ def get_float_preview(
     evaluator: GraphEvaluator,
     graph: ProjectGraph,
     request: PreviewRequest,
-) -> tuple[FloatPreviewCacheEntry, bool, float, float]:
-    output_signature = request.output_signature or evaluator.output_signature(graph, request.cache_node_id, request.frame)
-    cache_key = evaluator.float_preview_cache_key_for_signature(
-        request.cache_node_id,
-        request.frame,
-        output_signature,
-        request.channel,
-        request.max_width,
-        request.max_height,
-    )
-    cached = evaluator.get_cached_float_preview(cache_key)
-    if cached is not None:
-        return cached, True, 0.0, 0.0
+) -> FloatPreviewResult:
+    demand = evaluator.channel_demand_for(graph, request.eval_node_id, request.channel)
+    with evaluator.channel_demand_scope(demand):
+        output_signature = request.output_signature or evaluator.output_signature(graph, request.cache_node_id, request.frame)
+        cache_key = evaluator.float_preview_cache_key_for_signature(
+            request.cache_node_id,
+            request.frame,
+            output_signature,
+            request.channel,
+            request.max_width,
+            request.max_height,
+        )
+        lookup_started = time.perf_counter()
+        cached = evaluator.get_cached_float_preview(cache_key)
+        lookup_ms = (time.perf_counter() - lookup_started) * 1000.0
+        if cached is not None:
+            return FloatPreviewResult(cached, True, lookup_ms, 0.0, 0.0)
 
-    evaluate_started = time.perf_counter()
-    image = evaluator.evaluate_node(graph, request.eval_node_id, request.frame)
-    evaluate_ms = (time.perf_counter() - evaluate_started) * 1000.0
-    resize_started = time.perf_counter()
-    source_rgba, apply_ocio = preview_rgba_for_channel(image, request.channel)
-    preview_rgba = resize_float_rgba(source_rgba, max_width=request.max_width, max_height=request.max_height)
-    resize_ms = (time.perf_counter() - resize_started) * 1000.0
-    entry = FloatPreviewCacheEntry(
-        rgba=np.ascontiguousarray(preview_rgba, dtype=np.float32),
-        apply_ocio=apply_ocio,
-        colorspace=image.colorspace,
-        source_width=image.width,
-        source_height=image.height,
-        pixel_aspect=image.pixel_aspect,
-        format_bbox=dict(image.format_bbox or {}),
-        data_window=dict(image.data_window or {}),
-        bytes=int(preview_rgba.nbytes),
-    )
-    evaluator.store_cached_float_preview(cache_key, entry)
-    return entry, False, evaluate_ms, resize_ms
+        evaluate_started = time.perf_counter()
+        image = evaluator.evaluate_node(graph, request.eval_node_id, request.frame)
+        evaluate_ms = (time.perf_counter() - evaluate_started) * 1000.0
+        resize_started = time.perf_counter()
+        source_rgba, apply_ocio = preview_rgba_for_channel(image, request.channel)
+        preview_rgba = resize_float_rgba(source_rgba, max_width=request.max_width, max_height=request.max_height)
+        resize_ms = (time.perf_counter() - resize_started) * 1000.0
+        entry = FloatPreviewCacheEntry(
+            rgba=np.ascontiguousarray(preview_rgba, dtype=np.float32),
+            apply_ocio=apply_ocio,
+            colorspace=image.colorspace,
+            source_width=image.width,
+            source_height=image.height,
+            pixel_aspect=image.pixel_aspect,
+            format_bbox=dict(image.format_bbox or {}),
+            data_window=dict(image.data_window or {}),
+            bytes=int(preview_rgba.nbytes),
+        )
+        evaluator.store_cached_float_preview(cache_key, entry)
+        return FloatPreviewResult(entry, False, lookup_ms, evaluate_ms, resize_ms)
 
 
 def apply_viewer_process(rgba: np.ndarray, process: ViewerProcess) -> np.ndarray:
@@ -336,7 +385,9 @@ def warm_viewer_input_previews(
         if edge.source_node not in graph.nodes:
             continue
         try:
-            output_signature = evaluator.node_signature(graph, edge.source_node, frame)
+            demand = evaluator.channel_demand_for(graph, edge.source_node, channel)
+            with evaluator.channel_demand_scope(demand):
+                output_signature = evaluator.node_signature(graph, edge.source_node, frame)
             if output_signature in warmed_signatures:
                 continue
             warmed_signatures.add(output_signature)
@@ -361,6 +412,33 @@ def warm_viewer_input_previews(
 
 
 def render_cryptomatte_preview(
+    evaluator: GraphEvaluator,
+    graph: ProjectGraph,
+    node_id: str,
+    frame: int,
+    layer: str | None,
+    matte_ids: list[str],
+    max_width: int | None,
+    max_height: int | None,
+    settings: ProjectSettings,
+) -> bytes:
+    demand_channel = f"{layer}*" if layer else "*cryptomatte*"
+    demand = evaluator.channel_demand_for(graph, node_id, demand_channel)
+    with evaluator.channel_demand_scope(demand):
+        return _render_cryptomatte_preview_scoped(
+            evaluator,
+            graph,
+            node_id,
+            frame,
+            layer,
+            matte_ids,
+            max_width,
+            max_height,
+            settings,
+        )
+
+
+def _render_cryptomatte_preview_scoped(
     evaluator: GraphEvaluator,
     graph: ProjectGraph,
     node_id: str,

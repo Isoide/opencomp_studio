@@ -20,6 +20,7 @@ from opencomp.nodes.channel import (
     ViewMetadataNode,
 )
 from opencomp.nodes.colorspace import ColorspaceNode
+from opencomp.nodes.crop import CropNode
 from opencomp.nodes.cryptomatte import CryptomatteNode
 from opencomp.nodes.grade import GradeNode
 from opencomp.nodes.merge import MergeNode
@@ -42,6 +43,7 @@ NODE_DEFINITIONS = (
     NodeDefinition("Clamp", "Clamp", "Color", ClampNode(), ("in",)),
     NodeDefinition("Colorspace", "Colorspace", "Color", ColorspaceNode(), ("in",)),
     NodeDefinition("Blur", "Blur", "Filter", BlurNode(), ("in",)),
+    NodeDefinition("Crop", "Crop", "Transform", CropNode(), ("in",)),
     NodeDefinition("Reformat", "Reformat", "Transform", ReformatNode(), ("in",)),
     NodeDefinition("Scale", "Scale", "Transform", ScaleNode(), ("in",)),
     NodeDefinition("Transform", "Transform", "Transform", TransformNode(), ("in",)),
@@ -58,7 +60,7 @@ NODE_DEFINITIONS = (
     NodeDefinition("ModifyMetadata", "Modify Metadata", "Metadata", ModifyMetadataNode(), ("in",)),
     NodeDefinition("CopyMetadata", "CopyMetaData", "Metadata", CopyMetadataNode(), ("a", "b")),
     NodeDefinition("AddTimeCode", "AddTimeCode", "Metadata", AddTimeCodeNode(), ("in",)),
-    NodeDefinition("Merge", "Merge", "Merge", MergeNode(), ("a", "b", "mask")),
+    NodeDefinition("Merge", "Merge", "Merge", MergeNode(), ("b", "a", "mask", "a2", "a3", "a4", "a5")),
     NodeDefinition("Viewer", "Viewer", "Output", ViewerNode(), tuple(str(index) for index in range(10))),
 )
 

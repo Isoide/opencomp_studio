@@ -452,7 +452,7 @@ button:disabled {
 
 .viewer-controls {
   display: grid;
-  grid-template-columns: minmax(120px, 1fr) minmax(120px, 1fr) 112px auto minmax(300px, auto) auto;
+  grid-template-columns: minmax(120px, 1fr) minmax(120px, 1fr) 112px auto minmax(300px, auto);
   gap: 8px;
   align-items: end;
   padding: 8px 10px;
@@ -618,6 +618,48 @@ button:disabled {
   color: #b8ae9e;
   background: #151515;
   white-space: nowrap;
+}
+
+.viewer-hud-toggle {
+  appearance: none;
+  border: 1px solid #3f3a33;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  pointer-events: auto;
+  user-select: none;
+}
+
+.viewer-hud-toggle:hover,
+.viewer-hud-toggle:focus-visible {
+  border-color: #77c8b4;
+  color: #e5fff7;
+  background: rgb(20 25 23 / 92%);
+  outline: none;
+}
+
+.viewer-hud-toggle.collapsed {
+  max-width: 190px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.viewer-cache-hud {
+  position: absolute;
+  top: 8px;
+  right: 10px;
+  z-index: 4;
+  max-width: calc(100% - 20px);
+  min-height: 0;
+  padding: 6px 9px;
+  background: rgb(12 12 12 / 88%);
+  box-shadow: 0 0 12px rgb(0 0 0 / 28%);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.viewer-cache-hud.collapsed {
+  max-width: min(170px, calc(100% - 20px));
 }
 
 .viewer-toolbox {
@@ -787,13 +829,20 @@ button:disabled {
   position: absolute;
   left: 10px;
   bottom: 8px;
+  z-index: 4;
+  max-width: calc(100% - 20px);
   border: 1px solid #3f3a33;
   border-radius: 6px;
   padding: 4px 8px;
   color: #cfc7b5;
   background: #151515;
-  pointer-events: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.viewer-hud.collapsed {
+  max-width: min(155px, calc(100% - 20px));
 }
 
 .pixel-readout {

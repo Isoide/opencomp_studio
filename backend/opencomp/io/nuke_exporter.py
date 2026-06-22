@@ -12,6 +12,7 @@ from opencomp.nodes import NODE_DEFINITIONS
 
 NUKE_VERSION = "16.0 v6"
 INPUT_ORDER_BY_TYPE = {definition.type.lower(): tuple(definition.inputs) for definition in NODE_DEFINITIONS}
+INPUT_ORDER_BY_TYPE["merge"] = ("a", "b", "mask", "a2", "a3", "a4", "a5")
 MASK_SOCKETS = {"mask"}
 SAFE_BARE_WORD = re.compile(r"^[A-Za-z0-9_./:%#+@=-]+$")
 
@@ -210,6 +211,7 @@ def _nuke_block_for_node(node: Node, settings: ProjectSettings) -> dict[str, Any
         "clamp": _clamp_knobs,
         "colorspace": _colorspace_knobs,
         "blur": _blur_knobs,
+        "crop": _crop_knobs,
         "reformat": _reformat_knobs,
         "scale": _scale_knobs,
         "transform": _transform_knobs,
@@ -248,6 +250,7 @@ def _common_knobs(node: Node, node_class: str) -> dict[str, Any]:
         ("label", "label"),
         ("tile_color", "tile_color"),
         ("disable", "disable"),
+        ("disabled", "disable"),
         ("hide_input", "hide_input"),
         ("note_font_size", "note_font_size"),
     ):
@@ -282,7 +285,7 @@ def _read_knobs(node: Node, settings: ProjectSettings) -> tuple[str, dict[str, A
     colorspace = node.params.get("colorspace") or node.params.get("input_transform") or settings.working_colorspace
     if colorspace:
         knobs["colorspace"] = _nuke_colorspace(str(colorspace))
-    if bool(node.params.get("auto_alpha", False)):
+    if _truthy(node.params.get("auto_alpha", False)):
         knobs["auto_alpha"] = True
     return "Read", knobs
 
@@ -301,8 +304,8 @@ def _write_knobs(node: Node, settings: ProjectSettings) -> tuple[str, dict[str, 
     if node.params.get("colorspace") or node.params.get("output_transform"):
         knobs["colorspace"] = _nuke_colorspace(str(node.params.get("colorspace") or node.params.get("output_transform")))
     if node.params.get("create_directories") is not None:
-        knobs["create_directories"] = bool(node.params["create_directories"])
-    if node.params.get("limit_to_range"):
+        knobs["create_directories"] = _truthy(node.params["create_directories"])
+    if _truthy(node.params.get("limit_to_range", False)):
         knobs["use_limit"] = True
         knobs["first"] = int(node.params.get("frame_start") or node.params.get("first") or settings.frame_start)
         knobs["last"] = int(node.params.get("frame_end") or node.params.get("last") or settings.frame_end)
@@ -369,13 +372,25 @@ def _blur_knobs(node: Node, settings: ProjectSettings) -> tuple[str, dict[str, A
     return "Blur", {"channels": node.params.get("channels", "rgba"), "size": node.params.get("radius", node.params.get("size", 1.0))}
 
 
+def _crop_knobs(node: Node, settings: ProjectSettings) -> tuple[str, dict[str, Any]]:
+    width = int(node.params.get("width") or settings.width)
+    height = int(node.params.get("height") or settings.height)
+    x = int(float(node.params.get("x", node.params.get("left", 0))))
+    y = int(float(node.params.get("y", node.params.get("top", 0))))
+    return "Crop", {
+        "box": [x, y, x + width, y + height],
+        "reformat": _truthy(node.params.get("reformat", False)),
+        "crop": _truthy(node.params.get("black_outside", True)),
+    }
+
+
 def _reformat_knobs(node: Node, settings: ProjectSettings) -> tuple[str, dict[str, Any]]:
     width = int(node.params.get("width") or settings.width)
     height = int(node.params.get("height") or settings.height)
     return "Reformat", {
         "format": node.params.get("format") or _format_string(width, height, float(node.params.get("pixel_aspect", 1.0)), f"OpenComp_{width}x{height}"),
         "resize": node.params.get("resize", "distort"),
-        "pbb": bool(node.params.get("pbb", node.params.get("preserve_bbox", False))),
+        "pbb": _truthy(node.params.get("pbb", node.params.get("preserve_bbox", False))),
     }
 
 
@@ -384,10 +399,15 @@ def _scale_knobs(node: Node, settings: ProjectSettings) -> tuple[str, dict[str, 
 
 
 def _transform_knobs(node: Node, settings: ProjectSettings) -> tuple[str, dict[str, Any]]:
+    scale = node.params.get("scale", 1.0)
+    if node.params.get("scale_x") is not None or node.params.get("scale_y") is not None:
+        scale = [node.params.get("scale_x", scale), node.params.get("scale_y", scale)]
     return "Transform", {
         "translate": [node.params.get("translate_x", 0.0), node.params.get("translate_y", 0.0)],
-        "scale": node.params.get("scale", 1.0),
-        "center": node.params.get("center", [settings.width / 2, settings.height / 2]),
+        "scale": scale,
+        "rotate": node.params.get("rotate", node.params.get("rotation", 0.0)),
+        "center": node.params.get("center", [node.params.get("center_x", settings.width / 2), node.params.get("center_y", settings.height / 2)]),
+        "filter": node.params.get("filter", "bilinear"),
     }
 
 
@@ -579,6 +599,16 @@ def _bbox_mode(value: Any) -> str:
     if normalized in {"intersection", "intersect"}:
         return "intersection"
     return normalized or "union"
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on", "enabled", "enable", "checked"}
+    return bool(value)
 
 
 def _nuke_node_name(node_id: str) -> str:

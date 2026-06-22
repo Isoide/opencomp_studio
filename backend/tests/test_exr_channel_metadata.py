@@ -38,3 +38,15 @@ def test_auxiliary_scalar_channel_can_be_previewed_as_rgba() -> None:
     assert apply_ocio is False
     assert preview.shape == (frame.height, frame.width, 4)
     assert preview[:, :, 3].min() == 1.0
+
+
+def test_exact_single_exr_channel_uses_legacy_fast_path() -> None:
+    if not REFERENCE_3D_EXR.exists():
+        pytest.skip("Local 3D EXR reference file is not available.")
+
+    frame = read_image(str(REFERENCE_3D_EXR), frame=1071, colorspace="ACES2065-1", read_channels=["B"])
+
+    assert frame.metadata["exr/read_method"] == "legacy_single_channel"
+    assert frame.metadata["exr/read_channel"] == "B"
+    assert set(frame.channel_data) == {"B"}
+    assert frame.data.shape == (1492, 2020, 4)

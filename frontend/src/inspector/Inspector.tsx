@@ -278,13 +278,41 @@ function RootSettings({
         />
       </label>
       <label>
-        Workers
+        Tile Workers
         <input
           type="number"
           value={settings.tile_workers}
           min={1}
           disabled={!settings.tile_rendering_enabled}
           onChange={(event) => onSettingsChange({ tile_workers: Number(event.target.value) })}
+        />
+      </label>
+      <label>
+        Render Workers
+        <input
+          type="number"
+          value={settings.render_workers}
+          min={1}
+          onChange={(event) => onSettingsChange({ render_workers: Number(event.target.value) })}
+        />
+      </label>
+      <label>
+        Read Workers
+        <input
+          type="number"
+          value={settings.read_workers}
+          min={1}
+          onChange={(event) => onSettingsChange({ read_workers: Number(event.target.value) })}
+        />
+      </label>
+      <label>
+        Transfer Lanes
+        <input
+          type="number"
+          value={settings.viewer_tile_lanes}
+          min={1}
+          max={8}
+          onChange={(event) => onSettingsChange({ viewer_tile_lanes: Number(event.target.value) }, false)}
         />
       </label>
     </div>
@@ -362,7 +390,17 @@ function MetricsInspector({
         rows={requestRows.map((timing) => [
           `F${timing.frame} ${timing.transport}`,
           `${Math.round(timing.total_ms)}ms`,
-          `render ${Math.round(timing.backend_render_ms)}ms send ${Math.round(timing.send_ms)}ms`,
+          [
+            `backend ${Math.round(timing.backend_render_ms)}ms`,
+            `eval ${Math.round(timing.node_eval_ms ?? timing.backend_render_ms)}ms`,
+            timing.tile_native ? `native tiles ${Math.round(timing.tile_render_ms ?? 0)}ms` : "",
+            `resize ${Math.round(timing.resize_ms ?? 0)}ms`,
+            `encode ${Math.round(timing.tile_encode_ms ?? 0)}ms`,
+            `write ${Math.round(timing.ws_write_ms ?? timing.send_ms)}ms`,
+            timing.lane_count ? `lanes ${timing.lane_count}` : "",
+          ]
+            .filter(Boolean)
+            .join(" | "),
         ])}
       />
       <MetricTable
@@ -370,7 +408,17 @@ function MetricsInspector({
         rows={frontendRows.map((timing) => [
           `F${timing.frame} ${timing.transport}${timing.frontend_cache_hit ? " hit" : ""}`,
           `${Math.round(timing.total_ms)}ms`,
-          `${timing.compare_mode} ${formatBytes(timing.bytes)}`,
+          [
+            formatBytes(timing.bytes),
+            `wait ${Math.round(timing.ws_wait_ms ?? 0)}ms`,
+            `recv ${Math.round(timing.receive_ms ?? 0)}ms`,
+            `copy ${Math.round(timing.tile_copy_ms ?? 0)}ms`,
+            `upload ${Math.round(timing.webgl_upload_ms ?? 0)}ms`,
+            `draw ${Math.round(timing.webgl_draw_ms ?? 0)}ms`,
+            timing.browser_cache_hit_ms ? `browser ${Math.round(timing.browser_cache_hit_ms)}ms` : "",
+          ]
+            .filter(Boolean)
+            .join(" | "),
         ])}
       />
       <MetricTable

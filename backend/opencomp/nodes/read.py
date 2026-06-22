@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
+from opencomp.core.channel_demand import BASE_READ_CHANNELS, ChannelDemand
 from opencomp.core.models import ImageFrame, Node
 from opencomp.io.image_reader import read_image
 from opencomp.nodes.base import EvaluationContext, NodeEvaluationError
@@ -20,7 +21,7 @@ class ReadNode:
     ) -> ImageFrame:
         path = str(node.params.get("path") or node.params.get("file") or "builtin://gradient")
         colorspace = str(node.params.get("colorspace") or context.settings.working_colorspace)
-        read_channels = _read_channels(node)
+        read_channels = _read_channels(node, context)
         read_frame = _mapped_frame(node, context.frame)
         read_frame = _range_frame(node, read_frame)
         if read_frame is None:
@@ -39,6 +40,7 @@ class ReadNode:
                     "width": image.width,
                     "height": image.height,
                     "read_channels": "all" if read_channels is None else read_channels,
+                    "channel_demand": _demand_label(context.requested_channels),
                     "loaded_channel_groups": len(image.channel_data),
                 },
             )
@@ -65,6 +67,7 @@ class ReadNode:
                                 "width": image.width,
                                 "height": image.height,
                                 "read_channels": "all" if read_channels is None else read_channels,
+                                "channel_demand": _demand_label(context.requested_channels),
                                 "loaded_channel_groups": len(image.channel_data),
                             },
                         )
@@ -136,20 +139,63 @@ def _black_frame(node: Node, context: EvaluationContext) -> ImageFrame:
     )
 
 
-def _read_channels(node: Node) -> list[str] | None:
-    read_all = node.params.get("read_all_channels", node.params.get("load_all_channels", True))
-    if isinstance(read_all, str):
-        read_all = read_all.strip().lower() not in {"0", "false", "no", "off"}
-    if bool(read_all):
+def _read_channels(node: Node, context: EvaluationContext | None = None) -> list[str] | None:
+    read_all = node.params.get("read_all_channels", node.params.get("load_all_channels"))
+    if _truthy(read_all):
         return None
-    value = node.params.get("read_channels", node.params.get("channels_to_load"))
+    demand = context.requested_channels if context is not None else None
+    if demand is not None and demand.load_all:
+        return None
+
+    channels = list(BASE_READ_CHANNELS)
+    manual = _channel_list(node.params.get("read_channels", node.params.get("channels_to_load")))
+    if manual is None:
+        return None
+    channels.extend(manual)
+    if demand is not None:
+        channels.extend(demand.channels)
+    return _dedupe_channels(channels)
+
+
+def _channel_list(value: object) -> list[str] | None:
     if value is None or value == "":
-        return ["RGBA", "R", "G", "B", "A"]
+        return []
     if isinstance(value, str):
-        return [part.strip() for part in re.split(r"[,;\s]+", value) if part.strip()]
-    if isinstance(value, (list, tuple, set)):
-        return [str(part).strip() for part in value if str(part).strip()]
-    return ["RGBA", "R", "G", "B", "A"]
+        parts = [part.strip() for part in re.split(r"[,;\s]+", value) if part.strip()]
+    elif isinstance(value, (list, tuple, set)):
+        parts = [str(part).strip() for part in value if str(part).strip()]
+    else:
+        return []
+    if any(part.lower() in {"all", "*"} for part in parts):
+        return None
+    return parts
+
+
+def _truthy(value: object) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on", "all"}
+    return bool(value)
+
+
+def _dedupe_channels(channels: list[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for channel in channels:
+        cleaned = str(channel).strip()
+        if not cleaned:
+            continue
+        key = cleaned.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(cleaned)
+    return result
+
+
+def _demand_label(demand: ChannelDemand | None) -> str:
+    if demand is None:
+        return "auto-rgba"
+    return demand.cache_key()
 
 
 def _nearest_existing_frame(path: str, frame: int, node: Node) -> int | None:

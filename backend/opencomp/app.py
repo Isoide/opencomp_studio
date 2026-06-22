@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from opencomp.api.routes import router
 from opencomp.core.defaults import create_default_project
 from opencomp.core.evaluator import GraphEvaluator
+from opencomp.core.render_scheduler import RenderScheduler
 
 
 def create_app() -> FastAPI:
@@ -21,6 +22,8 @@ def create_app() -> FastAPI:
     app.state.project = project
     app.state.evaluator = GraphEvaluator(settings=project.settings)
     app.state.evaluator_settings_key = project.settings.model_dump_json()
+    app.state.render_scheduler = RenderScheduler()
+    app.state.render_jobs = {}
     app.state.graph_revision = 0
     app.include_router(router)
     return app

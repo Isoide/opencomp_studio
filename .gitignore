@@ -185,3 +185,5 @@ yarn-error.log*
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+*.err
+/.codex_natron

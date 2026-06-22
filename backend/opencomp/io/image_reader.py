@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -122,6 +123,13 @@ def _read_exr(
             "EXR reading requires the OpenEXR Python package. Install backend[exr] to enable it."
         ) from exc
 
+    single_channel = _legacy_single_channel_candidate(OpenEXR, path, read_channels)
+    if single_channel is not None:
+        try:
+            return _read_exr_legacy_single_channel(OpenEXR, path, frame, colorspace, single_channel)
+        except Exception:
+            pass
+
     if hasattr(OpenEXR, "File"):
         try:
             return _read_exr_v3(OpenEXR, path, frame, colorspace, read_channels=read_channels)
@@ -241,6 +249,100 @@ def _read_exr_legacy(
     )
 
 
+def _read_exr_legacy_single_channel(
+    OpenEXR: Any,
+    path: Path,
+    frame: int,
+    colorspace: str,
+    channel_name: str,
+) -> ImageFrame:
+    try:
+        import Imath  # type: ignore
+    except ImportError as exc:
+        raise NotImplementedError(
+            "This OpenEXR install needs Imath for legacy EXR reading, but Imath is missing."
+        ) from exc
+
+    exr = OpenEXR.InputFile(str(path))
+    try:
+        header = exr.header()
+        data_window = header["dataWindow"]
+        data_width = data_window.max.x - data_window.min.x + 1
+        data_height = data_window.max.y - data_window.min.y + 1
+        display_width, display_height = _display_size(header)
+        pixel_type = Imath.PixelType(Imath.PixelType.FLOAT)
+        buffer = exr.channel(channel_name, pixel_type)
+        plane = np.frombuffer(buffer, dtype=np.float32).reshape(data_height, data_width)
+        channel_data = _expand_channel_data_to_display({channel_name: plane}, header)
+        display_plane = channel_data[channel_name]
+
+        data = np.zeros((display_height, display_width, 4), dtype=np.float32)
+        main_index = {"r": 0, "g": 1, "b": 2, "a": 3}.get(channel_name.lower())
+        if main_index is not None:
+            data[:, :, main_index] = display_plane
+        if main_index != 3:
+            data[:, :, 3] = 1.0
+
+        pixel_aspect = _pixel_aspect_from_metadata(header)
+        metadata = {
+            **_base_file_metadata(path, frame, colorspace, display_width, display_height),
+            "input/pixel_aspect": pixel_aspect,
+            "exr/channels": _header_channel_names(header, channel_data),
+            "exr/read_method": "legacy_single_channel",
+            "exr/read_channel": channel_name,
+        }
+        for key, value in header.items():
+            if key == "channels":
+                continue
+            metadata[f"exr/{key}"] = _metadata_value(value)
+        return ImageFrame(
+            width=display_width,
+            height=display_height,
+            data=data,
+            channels=_header_channel_names(header, channel_data),
+            channel_data=channel_data,
+            pixel_aspect=pixel_aspect,
+            colorspace=colorspace,
+            frame=frame,
+            metadata=metadata,
+            data_window=_data_window_bbox(header),
+        )
+    finally:
+        exr.close()
+
+
+def _legacy_single_channel_candidate(OpenEXR: Any, path: Path, read_channels: Iterable[str] | None) -> str | None:
+    if read_channels is None or not hasattr(OpenEXR, "InputFile"):
+        return None
+    try:
+        exr = OpenEXR.InputFile(str(path))
+    except Exception:
+        return None
+    try:
+        header = exr.header()
+        available = list(header.get("channels", {}).keys())
+    except Exception:
+        return None
+    finally:
+        exr.close()
+    selected = _select_legacy_channel_names(available, read_channels)
+    if len(selected) != 1:
+        return None
+    requested = _requested_channel_set(read_channels)
+    if requested is None:
+        return None
+    selected_lower = selected[0].lower()
+    if selected_lower in {"rgba", "rgb"}:
+        return None
+    if any(_channel_pattern_matches(selected_lower, channel) for channel in requested):
+        return selected[0]
+    if selected_lower in requested:
+        return selected[0]
+    if selected_lower in {"r", "g", "b", "a"} and requested.intersection({"r", "g", "b", "a"}):
+        return selected[0]
+    return None
+
+
 def _base_file_metadata(path: Path, frame: int, colorspace: str, width: int, height: int) -> dict[str, object]:
     metadata: dict[str, object] = {
         "input/filename": str(path),
@@ -351,6 +453,9 @@ def _select_v3_channel_names(channel_names: Iterable[str], read_channels: Iterab
         if lower == "rgba" and requested.intersection({"r", "g", "b", "a", "rgb", "rgba", "red", "green", "blue", "alpha"}):
             selected.add(name)
             continue
+        if any(_channel_pattern_matches(lower, channel) for channel in requested):
+            selected.add(name)
+            continue
         if any(channel == lower or channel.startswith(f"{lower}.") for channel in requested):
             selected.add(name)
     return selected
@@ -366,6 +471,9 @@ def _select_legacy_channel_names(channel_names: Iterable[str], read_channels: It
         lower = name.lower()
         layer = lower.rsplit(".", 1)[0] if "." in lower else lower
         if lower in requested or layer in requested:
+            selected.append(name)
+            continue
+        if any(_channel_pattern_matches(lower, channel) or _channel_pattern_matches(layer, channel) for channel in requested):
             selected.append(name)
             continue
         if lower in {"r", "g", "b", "a"} and requested.intersection({"rgba", "rgb", "red", "green", "blue", "alpha"}):
@@ -389,6 +497,12 @@ def _requested_channel_set(read_channels: Iterable[str] | None) -> set[str] | No
     for name in list(requested):
         expanded.add(aliases.get(name, name))
     return expanded
+
+
+def _channel_pattern_matches(name: str, requested: str) -> bool:
+    if "*" not in requested and "?" not in requested:
+        return False
+    return fnmatch(name, requested)
 
 
 def _expand_channel_data_to_display(channel_data: dict[str, np.ndarray], header: dict[str, object]) -> dict[str, np.ndarray]:

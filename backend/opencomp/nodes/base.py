@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Protocol
 
 from opencomp.color.ocio_engine import OCIOColorEngine
+from opencomp.core.channel_demand import ChannelDemand
 from opencomp.core.models import ImageFrame, Node, ProjectSettings
 
 
@@ -12,6 +13,7 @@ class EvaluationContext:
     frame: int
     settings: ProjectSettings
     ocio: OCIOColorEngine
+    requested_channels: ChannelDemand | None = None
     metrics: Callable[[str, str, float, dict[str, Any] | None], None] | None = None
 
     def record_metric(

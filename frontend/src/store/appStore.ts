@@ -114,7 +114,11 @@ export const useAppStore = create<AppState>((set, get) => ({
   updatePreferences: (preferences) => {
     const project = get().project;
     if (!project) return;
-    set({ project: { ...project, preferences: { ...project.preferences, ...preferences } } });
+    const affectsViewer = Object.prototype.hasOwnProperty.call(preferences, "viewer_transfer_precision");
+    set({
+      project: { ...project, preferences: { ...project.preferences, ...preferences } },
+      renderRevision: affectsViewer ? get().renderRevision + 1 : get().renderRevision,
+    });
   },
   updateNode: (node) => {
     const graph = get().graph;
@@ -361,6 +365,8 @@ function defaultParamsFor(type: string): Record<string, unknown> {
       return { src: "ACES2065-1", dst: "ACEScg" };
     case "Blur":
       return { size: 2, channels: "rgba" };
+    case "Crop":
+      return { extent: "size", x: 0, y: 0, width: 1920, height: 1080, reformat: false, black_outside: true };
     case "Shuffle":
       return { input_b: "rgba", input_a: "none", output_layer: "rgba", out_r: "r", out_g: "g", out_b: "b", out_a: "a" };
     case "Copy":
@@ -401,11 +407,32 @@ function defaultParamsFor(type: string): Record<string, unknown> {
     case "AddTimeCode":
       return { start_frame: 1001, fps: 24, metadata_key: "input/timecode" };
     case "Reformat":
-      return { width: 1920, height: 1080 };
+      return {
+        width: 1920,
+        height: 1080,
+        resize: "distort",
+        centered: true,
+        preserve_bbox: false,
+        pixel_aspect: 1,
+        filter: "bilinear",
+        black_outside: true,
+      };
     case "Scale":
       return { scale: 1 };
     case "Transform":
-      return { translate_x: 0, translate_y: 0, scale: 1 };
+      return {
+        translate_x: 0,
+        translate_y: 0,
+        scale: 1,
+        scale_x: 1,
+        scale_y: 1,
+        rotate: 0,
+        center_x: 960,
+        center_y: 540,
+        filter: "bilinear",
+        clamp: false,
+        black_outside: true,
+      };
     case "Merge":
       return {
         operation: "over",

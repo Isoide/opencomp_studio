@@ -55,6 +55,9 @@ export type ProjectSettings = {
   tile_rendering_enabled: boolean;
   tile_height: number;
   tile_workers: number;
+  render_workers: number;
+  read_workers: number;
+  viewer_tile_lanes: number;
 };
 
 export type ScriptTab = {
@@ -73,6 +76,10 @@ export type ProjectPreferences = {
   viewer_zoom_speed: number;
   wheel_zoom_enabled: boolean;
   auto_connect_new_nodes: boolean;
+  playback_transfer_mode: "hybrid-preview" | "always-float" | "fast-display";
+  viewer_transfer_precision: "float32" | "float16" | "rgb10a2" | "uint8";
+  read_preload_enabled: boolean;
+  read_preload_max_frames: number;
   default_read_colorspace: string;
   custom_init_scripts: string[];
   path_substitutions: Array<{ source: string; target: string }>;
@@ -82,6 +89,7 @@ export type ProjectPreferences = {
     add_merge: string;
     add_shuffle: string;
     add_group: string;
+    toggle_disable: string;
     refresh_viewer: string;
     fit_viewer: string;
   };
@@ -242,11 +250,30 @@ export type RequestTiming = {
   bytes: number;
   float_cache_hit?: boolean;
   frontend_cache_hit?: boolean;
+  float_cache_lookup_ms?: number;
+  node_eval_ms?: number;
+  resize_ms?: number;
+  tile_encode_ms?: number;
+  tile_render_ms?: number;
+  ws_write_ms?: number;
+  tile_native?: boolean;
+  lane_count?: number;
+  tile_lane?: number | null;
+  tile_count?: number;
+  tile_count_total?: number;
+  transfer_mode?: string;
+  ws_wait_ms?: number;
+  receive_ms?: number;
+  tile_copy_ms?: number;
+  webgl_upload_ms?: number;
+  webgl_draw_ms?: number;
+  browser_cache_hit_ms?: number;
   timestamp: number;
 };
 
 export type FloatViewerFrameHeader = {
   type: string;
+  request_id?: string;
   node_id: string;
   frame: number;
   viewer_input: string | null;
@@ -260,25 +287,56 @@ export type FloatViewerFrameHeader = {
   apply_ocio: boolean;
   format_bbox: BBox;
   data_window: BBox;
-  dtype: "float32" | "float16";
+  dtype: "float32" | "float16" | "rgb10a2" | "uint8";
   layout: "rgba";
   byte_length: number;
   cache_hit: boolean;
+  float_cache_lookup_ms?: number;
   evaluate_ms: number;
+  node_eval_ms?: number;
   resize_ms: number;
   tile_stream?: boolean;
+  tile_width?: number | null;
   tile_height?: number | null;
   tile_count?: number;
+  tile_count_total?: number;
+  tile_lanes?: number;
+  tile_lane?: number | null;
+  transfer_mode?: string;
+  render_scale?: number;
+  mipmap_level?: number;
+  channels?: string[];
+  layers?: string[];
+  priority?: string;
+  cache_policy?: string;
+  storage?: string;
+  roi?: { x: number; y: number; width: number; height: number } | null;
+  zoom?: number | null;
   partial?: boolean;
   tiles_received?: number;
   tile_revision?: number;
+  updated_tile?: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  } | null;
 };
 
-export type FloatViewerPixels = Float32Array | Uint16Array;
+export type FloatViewerPixels = Float32Array | Uint16Array | Uint8Array | Uint32Array;
+
+export type FloatViewerClientMetrics = {
+  ws_wait_ms: number;
+  receive_ms: number;
+  tile_copy_ms: number;
+  browser_cache_hit_ms: number;
+  bytes: number;
+};
 
 export type FloatViewerFrame = {
   header: FloatViewerFrameHeader;
   pixels: FloatViewerPixels;
+  metrics?: FloatViewerClientMetrics;
 };
 
 type FloatViewerTileHeader = {
@@ -296,18 +354,26 @@ export type CacheStatus = {
   entries: number;
   preview_entries: number;
   float_preview_entries: number;
+  tile_cache_entries?: number;
+  execution_plan_entries?: number;
   hits: number;
   misses: number;
   preview_hits: number;
   preview_misses: number;
   float_preview_hits: number;
   float_preview_misses: number;
+  tile_cache_hits?: number;
+  tile_cache_misses?: number;
+  execution_plan_hits?: number;
+  execution_plan_misses?: number;
   memory_bytes: number;
   preview_memory_bytes: number;
   float_preview_memory_bytes: number;
+  tile_cache_memory_bytes?: number;
   max_memory_bytes: number;
   max_preview_memory_bytes: number;
   max_float_preview_memory_bytes: number;
+  max_tile_cache_memory_bytes?: number;
   graph_revision: number;
   cached_frames: number[];
   cached_final_preview_frames: number[];
@@ -329,10 +395,40 @@ export type ViewerFrameOptions = {
   gain?: number;
   saturation?: number;
   fstop?: number;
-  precision?: "float32" | "float16";
+  precision?: "float32" | "float16" | "rgb10a2" | "uint8";
   streamTiles?: boolean;
+  transferMode?:
+    | "float32-rgba"
+    | "float16-rgba"
+    | "float16-rgb"
+    | "single-channel-float16"
+    | "rgb10a2"
+    | "uint8-rgba"
+    | "display-preview";
+  viewport?: { x: number; y: number; width: number; height: number } | null;
+  zoom?: number | null;
+  tileWidth?: number;
   tileHeight?: number;
+  tileLanes?: number;
+  tileLane?: number;
+  requestId?: string;
+  roi?: { x: number; y: number; width: number; height: number } | null;
+  renderScale?: number;
+  mipmapLevel?: number;
+  channels?: string[];
+  layers?: string[];
+  storage?: "ram" | "gpu" | "frontend" | "disk";
+  priority?: "interactive" | "playback" | "background" | "render";
+  cachePolicy?: "read-through" | "refresh" | "bypass" | "write-through";
+  cancelBefore?: string | null;
 };
+
+function createRequestId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
 
 async function jsonRequest<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
@@ -357,6 +453,7 @@ function viewerFramePayload(
   return {
     node_id: nodeId,
     frame,
+    request_id: options.requestId ?? createRequestId(),
     display,
     view,
     channel,
@@ -368,7 +465,22 @@ function viewerFramePayload(
     fstop: options.fstop ?? 0,
     precision: options.precision ?? "float32",
     stream_tiles: options.streamTiles ?? false,
+    transfer_mode: options.transferMode ?? "float16-rgba",
+    viewport: options.viewport ?? null,
+    zoom: options.zoom ?? null,
+    tile_width: options.tileWidth ?? null,
     tile_height: options.tileHeight ?? null,
+    tile_lanes: options.tileLanes ?? null,
+    tile_lane: options.tileLane ?? null,
+    roi: options.roi ?? null,
+    render_scale: options.renderScale ?? 1,
+    mipmap_level: options.mipmapLevel ?? 0,
+    channels: options.channels ?? (channel ? [channel] : ["rgba"]),
+    layers: options.layers ?? [],
+    storage: options.storage ?? "frontend",
+    priority: options.priority ?? "interactive",
+    cache_policy: options.cachePolicy ?? "read-through",
+    cancel_before: options.cancelBefore ?? null,
   };
 }
 
@@ -381,12 +493,45 @@ function websocketUrl(path: string): string {
 }
 
 function allocateFloatPixels(header: FloatViewerFrameHeader): FloatViewerPixels {
-  const length = header.width * header.height * 4;
-  return header.dtype === "float16" ? new Uint16Array(length) : new Float32Array(length);
+  const length = viewerPixelElementCount(header.width, header.height, header.dtype);
+  if (header.dtype === "float16") return new Uint16Array(length);
+  if (header.dtype === "uint8") return new Uint8Array(length);
+  if (header.dtype === "rgb10a2") return new Uint32Array(length);
+  return new Float32Array(length);
 }
 
 function pixelsFromBuffer(dtype: FloatViewerFrameHeader["dtype"], buffer: ArrayBuffer): FloatViewerPixels {
-  return dtype === "float16" ? new Uint16Array(buffer) : new Float32Array(buffer);
+  if (dtype === "float16") return new Uint16Array(buffer);
+  if (dtype === "uint8") return new Uint8Array(buffer);
+  if (dtype === "rgb10a2") return new Uint32Array(buffer);
+  return new Float32Array(buffer);
+}
+
+function viewerPixelElementCount(width: number, height: number, dtype: FloatViewerFrameHeader["dtype"]) {
+  return width * height * (dtype === "rgb10a2" ? 1 : 4);
+}
+
+function viewerPixelElementsPerPixel(dtype: FloatViewerFrameHeader["dtype"]) {
+  return dtype === "rgb10a2" ? 1 : 4;
+}
+
+function roundMs(value: number) {
+  return Math.round(value * 100) / 100;
+}
+
+function websocketTextError(message: string): Error {
+  try {
+    const parsed = JSON.parse(message);
+    if (parsed.type === "viewer_request_cancelled") {
+      return new DOMException("The request was cancelled by a newer viewer request.", "AbortError");
+    }
+    if (parsed.type === "error") {
+      return new Error(parsed.detail ?? message);
+    }
+  } catch {
+    // Fall through to the raw text error.
+  }
+  return new Error(message);
 }
 
 function websocketBinary(path: string, payload: unknown, signal: AbortSignal | undefined, mimeType: string): Promise<Blob> {
@@ -427,7 +572,7 @@ function websocketBinary(path: string, payload: unknown, signal: AbortSignal | u
     socket.onmessage = (event) => {
       if (typeof event.data === "string") {
         finish(() => {
-          reject(new Error(event.data));
+          reject(websocketTextError(event.data));
         });
         return;
       }
@@ -456,11 +601,29 @@ function websocketFloatFrame(
 ): Promise<FloatViewerFrame> {
   return new Promise((resolve, reject) => {
     const socket = new WebSocket(websocketUrl(path));
+    const requestStarted = performance.now();
     let settled = false;
     let header: FloatViewerFrameHeader | null = null;
     let tileHeader: FloatViewerTileHeader | null = null;
     let tiledPixels: FloatViewerPixels | null = null;
     let tilesReceived = 0;
+    let firstMessageMs: number | null = null;
+    let tileCopyMs = 0;
+    let receivedBytes = 0;
+
+    const markMessage = () => {
+      if (firstMessageMs === null) firstMessageMs = performance.now() - requestStarted;
+    };
+    const metrics = (): FloatViewerClientMetrics => {
+      const total = performance.now() - requestStarted;
+      return {
+        ws_wait_ms: roundMs(firstMessageMs ?? total),
+        receive_ms: roundMs(Math.max(total - tileCopyMs, 0)),
+        tile_copy_ms: roundMs(tileCopyMs),
+        browser_cache_hit_ms: 0,
+        bytes: receivedBytes,
+      };
+    };
 
     const cleanup = () => {
       signal?.removeEventListener("abort", onAbort);
@@ -493,11 +656,19 @@ function websocketFloatFrame(
       socket.send(JSON.stringify(payload));
     };
     socket.onmessage = (event) => {
+      markMessage();
       if (typeof event.data === "string") {
         const parsed = JSON.parse(event.data);
         if (parsed.type === "error") {
           finish(() => {
             reject(new Error(parsed.detail ?? event.data));
+          });
+          return;
+        }
+        if (parsed.type === "viewer_request_cancelled") {
+          finish(() => {
+            socket.close();
+            reject(new DOMException("The request was cancelled by a newer viewer request.", "AbortError"));
           });
           return;
         }
@@ -525,11 +696,12 @@ function websocketFloatFrame(
             ...header,
             partial: false,
             tiles_received: tilesReceived,
-            tile_revision: tilesReceived,
+            tile_revision: tilesReceived + 1,
+            updated_tile: null,
           };
           const resolvedPixels = tiledPixels;
           finish(() => {
-            resolve({ header: resolvedHeader, pixels: resolvedPixels });
+            resolve({ header: resolvedHeader, pixels: resolvedPixels, metrics: metrics() });
           });
           return;
         }
@@ -555,6 +727,7 @@ function websocketFloatFrame(
         });
         return;
       }
+      receivedBytes += buffer.byteLength;
       if (header.tile_stream) {
         if (!tileHeader || !tiledPixels) {
           finish(() => {
@@ -563,9 +736,11 @@ function websocketFloatFrame(
           });
           return;
         }
+        const copyStarted = performance.now();
         const tilePixels = pixelsFromBuffer(header.dtype, buffer);
-        const rowStride = header.width * 4;
-        const expectedValues = tileHeader.width * tileHeader.height * 4;
+        const elementsPerPixel = viewerPixelElementsPerPixel(header.dtype);
+        const rowStride = header.width * elementsPerPixel;
+        const expectedValues = tileHeader.width * tileHeader.height * elementsPerPixel;
         if (tilePixels.length !== expectedValues) {
           finish(() => {
             socket.close();
@@ -574,11 +749,12 @@ function websocketFloatFrame(
           return;
         }
         for (let row = 0; row < tileHeader.height; row += 1) {
-          const sourceStart = row * tileHeader.width * 4;
-          const sourceEnd = sourceStart + tileHeader.width * 4;
-          const targetStart = (tileHeader.y + row) * rowStride + tileHeader.x * 4;
+          const sourceStart = row * tileHeader.width * elementsPerPixel;
+          const sourceEnd = sourceStart + tileHeader.width * elementsPerPixel;
+          const targetStart = (tileHeader.y + row) * rowStride + tileHeader.x * elementsPerPixel;
           tiledPixels.set(tilePixels.subarray(sourceStart, sourceEnd), targetStart);
         }
+        tileCopyMs += performance.now() - copyStarted;
         tilesReceived += 1;
         onProgress?.({
           header: {
@@ -586,15 +762,22 @@ function websocketFloatFrame(
             partial: true,
             tiles_received: tilesReceived,
             tile_revision: tilesReceived,
+            updated_tile: {
+              x: tileHeader.x,
+              y: tileHeader.y,
+              width: tileHeader.width,
+              height: tileHeader.height,
+            },
           },
           pixels: tiledPixels,
+          metrics: metrics(),
         });
         tileHeader = null;
         return;
       }
       const resolvedHeader = header;
       finish(() => {
-        resolve({ header: resolvedHeader, pixels: pixelsFromBuffer(resolvedHeader.dtype, buffer) });
+        resolve({ header: resolvedHeader, pixels: pixelsFromBuffer(resolvedHeader.dtype, buffer), metrics: metrics() });
       });
     };
     socket.onerror = () => {
@@ -603,6 +786,223 @@ function websocketFloatFrame(
     socket.onclose = () => {
       finish(() => reject(new Error("Viewer float WebSocket closed before returning data.")));
     };
+  });
+}
+
+function websocketFloatFrameLanes(
+  path: string,
+  payload: unknown,
+  laneCount: number,
+  signal: AbortSignal | undefined,
+  onProgress?: (frame: FloatViewerFrame) => void,
+): Promise<FloatViewerFrame> {
+  return new Promise((resolve, reject) => {
+    const resolvedLaneCount = Math.max(1, Math.min(Math.round(laneCount), 8));
+    const requestStarted = performance.now();
+    const sockets: WebSocket[] = [];
+    let settled = false;
+    let header: FloatViewerFrameHeader | null = null;
+    let pixels: FloatViewerPixels | null = null;
+    let completedLanes = 0;
+    let tilesReceived = 0;
+    let expectedTiles = 0;
+    let firstMessageMs: number | null = null;
+    let tileCopyMs = 0;
+    let receivedBytes = 0;
+
+    const markMessage = () => {
+      if (firstMessageMs === null) firstMessageMs = performance.now() - requestStarted;
+    };
+    const metrics = (): FloatViewerClientMetrics => {
+      const total = performance.now() - requestStarted;
+      return {
+        ws_wait_ms: roundMs(firstMessageMs ?? total),
+        receive_ms: roundMs(Math.max(total - tileCopyMs, 0)),
+        tile_copy_ms: roundMs(tileCopyMs),
+        browser_cache_hit_ms: 0,
+        bytes: receivedBytes,
+      };
+    };
+    const cleanup = () => {
+      signal?.removeEventListener("abort", onAbort);
+      for (const socket of sockets) {
+        socket.onopen = null;
+        socket.onmessage = null;
+        socket.onerror = null;
+        socket.onclose = null;
+      }
+    };
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      callback();
+    };
+    const closeSockets = () => {
+      for (const socket of sockets) {
+        try {
+          socket.close();
+        } catch {
+          // Ignore close races while cancelling lane requests.
+        }
+      }
+    };
+    const onAbort = () => {
+      finish(() => {
+        closeSockets();
+        reject(new DOMException("The request was aborted.", "AbortError"));
+      });
+    };
+    const maybeResolve = () => {
+      if (completedLanes < resolvedLaneCount || !header || !pixels) return;
+      if (expectedTiles > 0 && tilesReceived !== expectedTiles) {
+        finish(() => {
+          closeSockets();
+          reject(new Error(`Float lane stream ended after ${tilesReceived}/${expectedTiles} tiles.`));
+        });
+        return;
+      }
+      const resolvedHeader = header;
+      const resolvedPixels = pixels;
+      finish(() => {
+        resolve({
+          header: {
+            ...resolvedHeader,
+            partial: false,
+            tiles_received: tilesReceived,
+            tile_revision: tilesReceived + 1,
+            updated_tile: null,
+          },
+          pixels: resolvedPixels,
+          metrics: metrics(),
+        });
+      });
+    };
+
+    if (signal?.aborted) {
+      onAbort();
+      return;
+    }
+    signal?.addEventListener("abort", onAbort, { once: true });
+
+    for (let lane = 0; lane < resolvedLaneCount; lane += 1) {
+      const socket = new WebSocket(websocketUrl(path));
+      sockets.push(socket);
+      let tileHeader: FloatViewerTileHeader | null = null;
+      let laneClosed = false;
+      socket.binaryType = "arraybuffer";
+      socket.onopen = () => {
+        socket.send(JSON.stringify({ ...(payload as Record<string, unknown>), tile_lanes: resolvedLaneCount, tile_lane: lane }));
+      };
+      socket.onmessage = (event) => {
+        markMessage();
+        if (typeof event.data === "string") {
+          const parsed = JSON.parse(event.data);
+          if (parsed.type === "error") {
+            finish(() => {
+              closeSockets();
+              reject(new Error(parsed.detail ?? event.data));
+            });
+            return;
+          }
+          if (parsed.type === "viewer_request_cancelled") {
+            finish(() => {
+              closeSockets();
+              reject(new DOMException("The request was cancelled by a newer viewer request.", "AbortError"));
+            });
+            return;
+          }
+          if (parsed.type === "viewer_float_tile") {
+            tileHeader = parsed as FloatViewerTileHeader;
+            return;
+          }
+          if (parsed.type === "viewer_float_tiles_done") {
+            laneClosed = true;
+            completedLanes += 1;
+            maybeResolve();
+            return;
+          }
+          const nextHeader = parsed as FloatViewerFrameHeader;
+          if (!header) {
+            expectedTiles = nextHeader.tile_count_total ?? nextHeader.tile_count ?? 0;
+            header = {
+              ...nextHeader,
+              tile_count: expectedTiles,
+              tile_count_total: expectedTiles,
+              tile_lanes: resolvedLaneCount,
+              tile_lane: null,
+            };
+            pixels = allocateFloatPixels(header);
+          }
+          return;
+        }
+
+        if (!header || !pixels) {
+          finish(() => {
+            closeSockets();
+            reject(new Error("Float lane stream returned pixels before metadata."));
+          });
+          return;
+        }
+        const buffer = event.data instanceof Blob ? null : (event.data as ArrayBuffer);
+        if (!buffer || !tileHeader) {
+          finish(() => {
+            closeSockets();
+            reject(new Error("Float lane stream returned tile pixels before tile metadata."));
+          });
+          return;
+        }
+        receivedBytes += buffer.byteLength;
+        const copyStarted = performance.now();
+        const tilePixels = pixelsFromBuffer(header.dtype, buffer);
+        const elementsPerPixel = viewerPixelElementsPerPixel(header.dtype);
+        const rowStride = header.width * elementsPerPixel;
+        const expectedValues = tileHeader.width * tileHeader.height * elementsPerPixel;
+        if (tilePixels.length !== expectedValues) {
+          finish(() => {
+            closeSockets();
+            reject(new Error(`Float lane tile size mismatch: got ${tilePixels.length}, expected ${expectedValues}.`));
+          });
+          return;
+        }
+        for (let row = 0; row < tileHeader.height; row += 1) {
+          const sourceStart = row * tileHeader.width * elementsPerPixel;
+          const sourceEnd = sourceStart + tileHeader.width * elementsPerPixel;
+          const targetStart = (tileHeader.y + row) * rowStride + tileHeader.x * elementsPerPixel;
+          pixels.set(tilePixels.subarray(sourceStart, sourceEnd), targetStart);
+        }
+        tileCopyMs += performance.now() - copyStarted;
+        tilesReceived += 1;
+        onProgress?.({
+          header: {
+            ...header,
+            partial: true,
+            tiles_received: tilesReceived,
+            tile_revision: tilesReceived,
+            updated_tile: {
+              x: tileHeader.x,
+              y: tileHeader.y,
+              width: tileHeader.width,
+              height: tileHeader.height,
+            },
+          },
+          pixels,
+          metrics: metrics(),
+        });
+        tileHeader = null;
+      };
+      socket.onerror = () => {
+        finish(() => {
+          closeSockets();
+          reject(new Error("Viewer float lane WebSocket failed."));
+        });
+      };
+      socket.onclose = () => {
+        if (!laneClosed && !settled) {
+          finish(() => reject(new Error("Viewer float lane WebSocket closed before returning data.")));
+        }
+      };
+    }
   });
 }
 
@@ -694,6 +1094,36 @@ export const client = {
     jsonRequest<{ status: string; node_id: string; frame: number }>("/api/render", {
       method: "POST",
       body: JSON.stringify({ node_id: nodeId, frame }),
+    }),
+  warmViewerFrames: (
+    nodeId: string,
+    frames: number[],
+    options: { viewerInput?: string | null; display?: string | null; view?: string | null; channel?: string | null } = {},
+  ) =>
+    jsonRequest<{ status: string; frames: number[] }>("/api/viewer/warm", {
+      method: "POST",
+      body: JSON.stringify({
+        node_id: nodeId,
+        frames,
+        viewer_input: options.viewerInput ?? null,
+        display: options.display ?? null,
+        view: options.view ?? null,
+        channel: options.channel ?? null,
+      }),
+    }),
+  warmReadFrames: (
+    nodeId: string,
+    frames: number[],
+    options: { viewerInput?: string | null; channel?: string | null } = {},
+  ) =>
+    jsonRequest<{ status: string; frames: number[]; read_nodes: string[] }>("/api/reads/warm", {
+      method: "POST",
+      body: JSON.stringify({
+        node_id: nodeId,
+        frames,
+        viewer_input: options.viewerInput ?? null,
+        channel: options.channel ?? null,
+      }),
     }),
   cryptomattePick: (nodeId: string, frame: number, layer: string | null, x: number, y: number) =>
     jsonRequest<CryptomattePick>("/api/cryptomatte/pick", {
@@ -791,22 +1221,22 @@ export const client = {
       throw new Error("Viewer float WebSocket is unavailable in this backend session.");
     }
     try {
-      const data = await websocketFloatFrame(
-        "/ws/viewer/float",
-        viewerFramePayload(nodeId, frame, display, view, channel, {
-          ...options,
-          gain: 1,
-          saturation: 1,
-          fstop: 0,
-          compareInput: null,
-          compareMode: "none",
-          precision: options.precision ?? "float16",
-          streamTiles: options.streamTiles ?? true,
-          tileHeight: options.tileHeight ?? 128,
-        }),
-        signal,
-        onProgress,
-      );
+      const payload = viewerFramePayload(nodeId, frame, display, view, channel, {
+        ...options,
+        gain: 1,
+        saturation: 1,
+        fstop: 0,
+        compareInput: null,
+        compareMode: "none",
+        precision: options.precision ?? "float16",
+        streamTiles: options.streamTiles ?? true,
+        tileHeight: options.tileHeight ?? 128,
+      });
+      const lanes = Math.max(1, Math.min(Math.round(options.tileLanes ?? 1), 8));
+      const data =
+        lanes > 1 && (options.streamTiles ?? true)
+          ? await websocketFloatFrameLanes("/ws/viewer/float", payload, lanes, signal, onProgress)
+          : await websocketFloatFrame("/ws/viewer/float", payload, signal, onProgress);
       viewerFloatWebSocketSupported = true;
       return data;
     } catch (error) {
