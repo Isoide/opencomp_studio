@@ -15,7 +15,9 @@ import numpy as np
 
 from opencomp.color.ocio_engine import OCIOColorEngine
 from opencomp.core.channel_demand import ChannelDemand, channel_demand_for_graph
+from opencomp.core.expressions import ExpressionResolver
 from opencomp.core.models import Edge, ImageFrame, Node, ProjectGraph, ProjectSettings, TileWindow
+from opencomp.core.perf_logging import emit_perf_event, perf_phase_logging_enabled, perf_preview_logging_enabled
 from opencomp.core.render_contract import (
     ExecutionPlan,
     RenderRequest,
@@ -65,6 +67,7 @@ TILE_LOCAL_NODE_TYPES = {
     "viewer",
     "viewmetadata",
 }
+TIME_REMAP_NODE_TYPES = {"framehold", "framerange", "retime"}
 BYPASS_SOCKET_PRIORITY = ("a", "in", "input", "0", "b", "mask")
 MERGE_BYPASS_SOCKET_PRIORITY = ("b", "bg", "a", "in", "input", "0", "mask")
 
@@ -365,8 +368,10 @@ class GraphEvaluator:
     ) -> ImageFrame:
 
         node = graph.nodes[node_id]
+        resolver = self._expression_resolver(graph, frame)
+        resolved_node = self._resolved_node(graph, node_id, frame, resolver)
         operation = NODE_REGISTRY.get(node.type.lower())
-        if operation is None and not _node_disabled(node):
+        if operation is None and not _node_disabled(resolved_node):
             raise UnknownNodeTypeError(f"Unsupported node type '{node.type}' on node '{node_id}'.")
 
         self._begin_node(node.id)
@@ -376,20 +381,27 @@ class GraphEvaluator:
             input_edges = graph.incoming_edges(node_id)
             if node.type.lower() == "viewer":
                 input_edges = _viewer_input_edges(graph, node_id)
-            bypass_edge = _preferred_bypass_edge(input_edges, node.type) if _node_disabled(node) else None
+            bypass_edge = _preferred_bypass_edge(input_edges, node.type) if _node_disabled(resolved_node) else None
             if bypass_edge is not None:
                 input_edges = [bypass_edge]
             elif operation is None:
                 raise UnknownNodeTypeError(f"Unsupported node type '{node.type}' on node '{node_id}'.")
 
-            inputs = self._evaluate_inputs(graph, frame, input_edges, visiting)
+            inputs = {} if resolved_node.type.lower() in TIME_REMAP_NODE_TYPES else self._evaluate_inputs(graph, frame, input_edges, visiting)
             visiting.remove(node_id)
+            edge_map = {edge.target_socket: edge.source_node for edge in input_edges}
 
             context = EvaluationContext(
                 frame=frame,
                 settings=self.settings,
                 ocio=self.ocio,
                 requested_channels=self._current_channel_demand(),
+                evaluate_input_at=lambda socket, target_frame: self._evaluate(
+                    graph,
+                    edge_map.get(socket) or next(iter(edge_map.values())),
+                    target_frame,
+                    set(visiting),
+                ),
                 metrics=lambda metric_node_id, phase, duration_ms, details=None: self.record_phase_timing(
                     metric_node_id,
                     phase,
@@ -398,9 +410,9 @@ class GraphEvaluator:
                 ),
             )
             result = (
-                _bypass_frame(node, inputs)
+                _bypass_frame(resolved_node, inputs)
                 if bypass_edge is not None
-                else self._evaluate_operation(node, operation, inputs, context)
+                else self._evaluate_operation(resolved_node, operation, inputs, context)
             )
         except NodeEvaluationError:
             raise
@@ -626,7 +638,8 @@ class GraphEvaluator:
         if window.width <= 0 or window.height <= 0:
             return _empty_tile(window, frame, self.settings.working_colorspace)
 
-        node = graph.nodes[node_id]
+        resolver = self._expression_resolver(graph, frame)
+        node = self._resolved_node(graph, node_id, frame, resolver)
         node_type = node.type.lower()
         if node_type == "viewer":
             input_edges = _viewer_input_edges(graph, node_id)
@@ -644,11 +657,12 @@ class GraphEvaluator:
             return self._evaluate_full_tile(graph, node_id, frame, window, visiting, "crop.reformat")
         if node_type == "transform":
             return self._evaluate_full_tile(graph, node_id, frame, window, visiting, "transform.affine")
+        if node_type in TIME_REMAP_NODE_TYPES:
+            return self._evaluate_full_tile(graph, node_id, frame, window, visiting, "time_remap")
         can_tile_bypass = _node_disabled(node) and _preferred_bypass_edge(graph.incoming_edges(node_id), node.type) is not None
         if node_type not in TILE_LOCAL_NODE_TYPES and not can_tile_bypass:
             return self._evaluate_full_tile(graph, node_id, frame, window, visiting, "unsupported")
 
-        node = graph.nodes[node_id]
         operation = NODE_REGISTRY.get(node_type)
         if operation is None and not can_tile_bypass:
             raise UnknownNodeTypeError(f"Unsupported node type '{node.type}' on node '{node_id}'.")
@@ -665,11 +679,19 @@ class GraphEvaluator:
                 raise UnknownNodeTypeError(f"Unsupported node type '{node.type}' on node '{node_id}'.")
             inputs = self._evaluate_tile_inputs(graph, frame, input_edges, window, visiting)
             visiting.remove(node_id)
+            edge_map = {edge.target_socket: edge.source_node for edge in input_edges}
             context = EvaluationContext(
                 frame=frame,
                 settings=self.settings,
                 ocio=self.ocio,
                 requested_channels=self._current_channel_demand(),
+                evaluate_input_at=lambda socket, target_frame: self._evaluate_tile_cached(
+                    graph,
+                    edge_map.get(socket) or next(iter(edge_map.values())),
+                    target_frame,
+                    window,
+                    set(visiting),
+                ),
                 metrics=lambda metric_node_id, phase, duration_ms, details=None: self.record_phase_timing(
                     metric_node_id,
                     phase,
@@ -936,7 +958,8 @@ class GraphEvaluator:
             self._prune_cache()
 
     def node_signature(self, graph: ProjectGraph, node_id: str, frame: int) -> str:
-        signature = _node_signature(graph, node_id, frame, visiting=set())
+        resolver = self._expression_resolver(graph, frame)
+        signature = _node_signature(graph, node_id, frame, visiting=set(), resolver=resolver)
         demand = self._current_channel_demand() or channel_demand_for_graph(graph, node_id)
         return _signature_with_channel_demand(signature, demand)
 
@@ -955,6 +978,29 @@ class GraphEvaluator:
         requested_channel: str | None = None,
     ) -> ChannelDemand:
         return channel_demand_for_graph(graph, node_id, requested_channel)
+
+    def resolved_node(self, graph: ProjectGraph, node_id: str, frame: int) -> Node:
+        return self._resolved_node(graph, node_id, frame, self._expression_resolver(graph, frame))
+
+    def bindable_outputs(self, graph: ProjectGraph, node_id: str, frame: int) -> dict[str, Any]:
+        return self._expression_resolver(graph, frame).bindable_outputs(node_id)
+
+    def expression_errors(self, graph: ProjectGraph, node_id: str, frame: int) -> dict[str, str]:
+        return self._expression_resolver(graph, frame).expression_errors(node_id)
+
+    def _expression_resolver(self, graph: ProjectGraph, frame: int) -> ExpressionResolver:
+        return ExpressionResolver(graph, self.settings, frame)
+
+    def _resolved_node(
+        self,
+        graph: ProjectGraph,
+        node_id: str,
+        frame: int,
+        resolver: ExpressionResolver,
+    ) -> Node:
+        node = graph.nodes[node_id]
+        resolved = resolver.resolved_params(node_id)
+        return node.model_copy(update={"params": resolved})
 
     @contextmanager
     def channel_demand_scope(self, demand: ChannelDemand | None) -> Iterator[None]:
@@ -1194,6 +1240,8 @@ class GraphEvaluator:
     def record_preview_timing(self, node_id: str, timing: dict[str, Any]) -> None:
         with self._lock:
             self.preview_timings[node_id] = {**timing, "timestamp": time.time()}
+        if perf_preview_logging_enabled():
+            emit_perf_event("preview_timing", {"node_id": node_id, "timing": timing})
 
     def record_phase_timing(
         self,
@@ -1213,11 +1261,22 @@ class GraphEvaluator:
                 }
             )
             del self.phase_timings[:-160]
+        if perf_phase_logging_enabled():
+            emit_perf_event(
+                "phase_timing",
+                {
+                    "node_id": node_id,
+                    "phase": phase,
+                    "duration_ms": round(duration_ms, 2),
+                    "details": details or {},
+                },
+            )
 
     def record_request_timing(self, timing: dict[str, Any]) -> None:
         with self._lock:
             self.request_timings.append({**timing, "timestamp": time.time()})
             del self.request_timings[:-80]
+        emit_perf_event("request_timing", timing)
 
     def _get_cached(self, cache_key: CacheKey) -> ImageFrame | None:
         if not self.settings.cache_enabled:
@@ -1579,17 +1638,24 @@ def _params_hash(params: dict) -> str:
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()
 
 
-def _node_signature(graph: ProjectGraph, node_id: str, frame: int, visiting: set[str]) -> str:
+def _node_signature(
+    graph: ProjectGraph,
+    node_id: str,
+    frame: int,
+    visiting: set[str],
+    resolver: ExpressionResolver,
+) -> str:
     if node_id in visiting:
         chain = " -> ".join([*visiting, node_id])
         raise GraphCycleError(f"Node graph contains a cycle: {chain}")
     node = graph.nodes[node_id]
+    resolved_node = node.model_copy(update={"params": resolver.resolved_params(node_id)})
     visiting.add(node_id)
     incoming = []
     input_edges = graph.incoming_edges(node_id)
-    if node.type.lower() == "viewer":
+    if resolved_node.type.lower() == "viewer":
         input_edges = _viewer_input_edges(graph, node_id)
-    bypass_edge = _preferred_bypass_edge(input_edges, node.type) if _node_disabled(node) else None
+    bypass_edge = _preferred_bypass_edge(input_edges, resolved_node.type) if _node_disabled(resolved_node) else None
     if bypass_edge is not None:
         input_edges = [bypass_edge]
     for edge in sorted(input_edges, key=lambda item: (item.target_socket, item.source_node)):
@@ -1598,24 +1664,26 @@ def _node_signature(graph: ProjectGraph, node_id: str, frame: int, visiting: set
                 "source_node": edge.source_node,
                 "source_socket": edge.source_socket,
                 "target_socket": edge.target_socket,
-                "signature": _node_signature(graph, edge.source_node, frame, visiting),
+                "signature": _node_signature(graph, edge.source_node, frame, visiting, resolver),
             }
         )
     visiting.remove(node_id)
     if bypass_edge is not None:
         payload = {
-            "id": node.id,
-            "type": node.type,
+            "id": resolved_node.id,
+            "type": resolved_node.type,
             "disabled": True,
             "bypass_socket": bypass_edge.target_socket,
             "inputs": incoming,
+            "expression": resolver.node_signature_payload(node),
         }
     else:
         payload = {
-            "id": node.id,
-            "type": node.type,
-            "params": node.params,
-            "source": _source_signature(node.type, node.params, frame),
+            "id": resolved_node.id,
+            "type": resolved_node.type,
+            "params": resolved_node.params,
+            "source": _source_signature(resolved_node.type, resolved_node.params, frame),
+            "expression": resolver.node_signature_payload(node),
             "inputs": incoming,
         }
     return hashlib.sha1(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()

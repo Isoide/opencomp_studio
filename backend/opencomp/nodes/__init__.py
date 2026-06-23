@@ -27,6 +27,7 @@ from opencomp.nodes.merge import MergeNode
 from opencomp.nodes.read import ReadNode
 from opencomp.nodes.reformat import ReformatNode
 from opencomp.nodes.transform import ScaleNode, TransformNode
+from opencomp.nodes.time_color import ColorCorrectNode, FrameHoldNode, FrameRangeNode, HueCorrectNode, RetimeNode
 from opencomp.nodes.viewer import ViewerNode
 from opencomp.nodes.write import WriteNode
 from opencomp.nodes.base import NodeDefinition
@@ -47,6 +48,9 @@ NODE_DEFINITIONS = (
     NodeDefinition("Reformat", "Reformat", "Transform", ReformatNode(), ("in",)),
     NodeDefinition("Scale", "Scale", "Transform", ScaleNode(), ("in",)),
     NodeDefinition("Transform", "Transform", "Transform", TransformNode(), ("in",)),
+    NodeDefinition("FrameHold", "FrameHold", "Transform", FrameHoldNode(), ("in",)),
+    NodeDefinition("FrameRange", "FrameRange", "Transform", FrameRangeNode(), ("in",)),
+    NodeDefinition("Retime", "Retime", "Transform", RetimeNode(), ("in",)),
     NodeDefinition("Shuffle", "Shuffle", "Channel", ShuffleNode(), ("b", "a")),
     NodeDefinition("Copy", "Copy", "Channel", CopyNode(), ("a", "b")),
     NodeDefinition("ChannelMerge", "ChannelMerge", "Channel", ChannelMergeNode(), ("a", "b", "mask")),
@@ -55,6 +59,8 @@ NODE_DEFINITIONS = (
     NodeDefinition("Premult", "Premult", "Channel", PremultNode(), ("in",)),
     NodeDefinition("Unpremult", "Unpremult", "Channel", UnpremultNode(), ("in",)),
     NodeDefinition("Cryptomatte", "Cryptomatte", "Keyer", CryptomatteNode(), ("in",)),
+    NodeDefinition("ColorCorrect", "ColorCorrect", "Color", ColorCorrectNode(), ("in",)),
+    NodeDefinition("HueCorrect", "HueCorrect", "Color", HueCorrectNode(), ("in",)),
     NodeDefinition("ViewMetadata", "ViewMetaData", "Metadata", ViewMetadataNode(), ("in",)),
     NodeDefinition("CompareMetadata", "CompareMetaData", "Metadata", CompareMetadataNode(), ("a", "b")),
     NodeDefinition("ModifyMetadata", "Modify Metadata", "Metadata", ModifyMetadataNode(), ("in",)),

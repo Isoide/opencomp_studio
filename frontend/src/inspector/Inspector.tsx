@@ -1,4 +1,4 @@
-import type { CacheStatus, ColorConfig, NodeMetadata, NodeModel, NodeTiming, ProjectSettings, RequestTiming } from "../api/client";
+import type { CacheStatus, ColorConfig, NodeMetadata, NodeModel, NodeTiming, ProjectGraph, ProjectSettings, RequestTiming } from "../api/client";
 import type { LogEntry } from "../store/appStore";
 import type { WebglViewerMetrics } from "../viewer/webglFloatViewer";
 
@@ -6,6 +6,7 @@ export type InspectorTab = "node" | "root" | "metrics" | "log";
 
 type Props = {
   node: NodeModel | null;
+  graph: ProjectGraph | null;
   metadata: NodeMetadata | null;
   settings: ProjectSettings | null;
   colorConfig: ColorConfig | null;
@@ -24,6 +25,7 @@ type Props = {
 
 export function Inspector({
   node,
+  graph,
   metadata,
   settings,
   colorConfig,
@@ -58,7 +60,7 @@ export function Inspector({
       </div>
       {activeTab === "node" &&
         (node ? (
-          <NodeInspector node={node} metadata={metadata} onChange={onChange} onRenderWrite={onRenderWrite} />
+          <NodeInspector node={node} graph={graph} metadata={metadata} onChange={onChange} onRenderWrite={onRenderWrite} />
         ) : (
           <div className="empty-copy">Select a node</div>
         ))}
@@ -81,16 +83,19 @@ export function Inspector({
 
 function NodeInspector({
   node,
+  graph,
   metadata,
   onChange,
   onRenderWrite,
 }: {
   node: NodeModel;
+  graph: ProjectGraph | null;
   metadata: NodeMetadata | null;
   onChange: (node: NodeModel) => void;
   onRenderWrite: () => void;
 }) {
   const params = Object.entries(node.params);
+  const expressionSuggestions = buildExpressionSuggestions(graph);
   return (
     <>
       <div className="inspector-heading">{node.name || node.type}</div>
@@ -101,7 +106,14 @@ function NodeInspector({
       {params.map(([key, value]) => (
         <label key={key}>
           {formatParamLabel(key)}
-          <ParamInput node={node} paramKey={key} value={value} onChange={onChange} />
+          <ParamInput
+            node={node}
+            paramKey={key}
+            value={value}
+            metadata={metadata}
+            expressionSuggestions={expressionSuggestions}
+            onChange={onChange}
+          />
         </label>
       ))}
       {node.type.toLowerCase() === "write" && (
@@ -130,6 +142,20 @@ function NodeInspector({
                 </div>
               ))}
           </div>
+          <details>
+            <summary>Resolved Params</summary>
+            <pre>{JSON.stringify(metadata.resolved_params, null, 2)}</pre>
+          </details>
+          <details>
+            <summary>Bindable Outputs</summary>
+            <pre>{JSON.stringify(metadata.bindable_outputs, null, 2)}</pre>
+          </details>
+          {!!Object.keys(metadata.expression_errors).length && (
+            <details open>
+              <summary>Expression Errors</summary>
+              <pre>{JSON.stringify(metadata.expression_errors, null, 2)}</pre>
+            </details>
+          )}
         </details>
       )}
     </>
@@ -482,42 +508,110 @@ function ParamInput({
   node,
   paramKey,
   value,
+  metadata,
+  expressionSuggestions,
   onChange,
 }: {
   node: NodeModel;
   paramKey: string;
   value: unknown;
+  metadata: NodeMetadata | null;
+  expressionSuggestions: string[];
   onChange: (node: NodeModel) => void;
 }) {
+  const expression = node.param_expressions?.[paramKey] ?? null;
+  const expressionEnabled = Boolean(expression?.enabled && expression?.source);
+  const resolvedValue = metadata?.resolved_params?.[paramKey];
+  const expressionError = metadata?.expression_errors?.[paramKey];
+  const datalistId = `expr-${node.id}-${paramKey}`;
   const options = optionsFor(node.type, paramKey);
+  const toggleExpression = () => {
+    const next = { ...(node.param_expressions ?? {}) };
+    if (expressionEnabled) {
+      delete next[paramKey];
+    } else {
+      next[paramKey] = { source: `node("${node.id}").${paramKey}`, enabled: true, compiled_cache_key: null };
+    }
+    onChange({ ...node, param_expressions: next });
+  };
+  const updateExpression = (source: string) => {
+    onChange({
+      ...node,
+      param_expressions: {
+        ...(node.param_expressions ?? {}),
+        [paramKey]: { source, enabled: true, compiled_cache_key: null },
+      },
+    });
+  };
+  if (expressionEnabled) {
+    return (
+      <div className="expression-param">
+        <div className="expression-row">
+          <button type="button" onClick={toggleExpression}>
+            fx
+          </button>
+          <input list={datalistId} value={expression?.source ?? ""} onChange={(event) => updateExpression(event.target.value)} />
+          <datalist id={datalistId}>
+            {expressionSuggestions.map((suggestion) => (
+              <option key={suggestion} value={suggestion} />
+            ))}
+          </datalist>
+        </div>
+        <div className="expression-meta">
+          <span>{expressionError ? `error: ${expressionError}` : `resolved: ${formatMetadataValue(resolvedValue)}`}</span>
+        </div>
+      </div>
+    );
+  }
   if (options) {
     return (
-      <select
-        value={String(value ?? "")}
-        onChange={(event) => onChange({ ...node, params: { ...node.params, [paramKey]: event.target.value } })}
-      >
-        {options.map((option) => (
-          <option key={option} value={option}>
-            {option}
-          </option>
-        ))}
-      </select>
+      <div className="expression-param">
+        <div className="expression-row">
+          <button type="button" onClick={toggleExpression}>
+            fx
+          </button>
+          <select
+            value={String(value ?? "")}
+            onChange={(event) => onChange({ ...node, params: { ...node.params, [paramKey]: event.target.value } })}
+          >
+            {options.map((option) => (
+              <option key={option} value={option}>
+                {option}
+              </option>
+            ))}
+          </select>
+        </div>
+      </div>
     );
   }
 
   return (
-    <input
-      type={typeof value === "number" ? "number" : typeof value === "boolean" ? "checkbox" : "text"}
-      checked={typeof value === "boolean" ? value : undefined}
-      value={typeof value === "boolean" ? undefined : String(value ?? "")}
-      step="0.01"
-      onChange={(event) => {
-        let next: unknown = event.target.value;
-        if (typeof value === "number") next = Number(event.target.value);
-        if (typeof value === "boolean") next = event.target.checked;
-        onChange({ ...node, params: { ...node.params, [paramKey]: next } });
-      }}
-    />
+    <div className="expression-param">
+      <div className="expression-row">
+        <button type="button" onClick={toggleExpression}>
+          fx
+        </button>
+        <input
+          type={typeof value === "number" ? "number" : typeof value === "boolean" ? "checkbox" : "text"}
+          checked={typeof value === "boolean" ? value : undefined}
+          value={typeof value === "boolean" ? undefined : formatInputValue(value)}
+          step="0.01"
+          onChange={(event) => {
+            let next: unknown = event.target.value;
+            if (typeof value === "number") next = Number(event.target.value);
+            if (typeof value === "boolean") next = event.target.checked;
+            if (Array.isArray(value) || (value && typeof value === "object")) {
+              try {
+                next = JSON.parse(event.target.value);
+              } catch {
+                next = event.target.value;
+              }
+            }
+            onChange({ ...node, params: { ...node.params, [paramKey]: next } });
+          }}
+        />
+      </div>
+    </div>
   );
 }
 
@@ -546,6 +640,12 @@ function optionsFor(type: string, paramKey: string) {
   }
   if (normalized === "read" && paramKey === "frame_mode") {
     return ["expression", "start at", "offset", "frame"];
+  }
+  if (normalized === "framerange" && paramKey === "mode") {
+    return ["original", "hold", "black", "loop", "bounce"];
+  }
+  if (normalized === "retime" && paramKey === "filter") {
+    return ["nearest", "linear"];
   }
   if (normalized === "read" && paramKey === "missing_frames") {
     return ["error", "black", "nearest frame"];
@@ -660,6 +760,24 @@ function optionsFor(type: string, paramKey: string) {
 
 function formatParamLabel(key: string) {
   return key.replace(/_/g, " ").replace(/\b\w/g, (match) => match.toUpperCase());
+}
+
+function formatInputValue(value: unknown) {
+  if (Array.isArray(value) || (value && typeof value === "object")) {
+    return JSON.stringify(value);
+  }
+  return String(value ?? "");
+}
+
+function buildExpressionSuggestions(graph: ProjectGraph | null) {
+  if (!graph) return ["frame", "fps"];
+  const suggestions = new Set<string>(["frame", "fps"]);
+  for (const node of Object.values(graph.nodes)) {
+    for (const key of Object.keys(node.params ?? {})) {
+      suggestions.add(`node("${node.id}").${key}`);
+    }
+  }
+  return [...suggestions].sort((left, right) => left.localeCompare(right));
 }
 
 function average(values: number[]) {

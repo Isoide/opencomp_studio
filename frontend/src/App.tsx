@@ -51,7 +51,12 @@ const ADDABLE_NODES = [
   "Reformat",
   "Scale",
   "Transform",
+  "FrameHold",
+  "FrameRange",
+  "Retime",
   "Merge",
+  "ColorCorrect",
+  "HueCorrect",
 ];
 
 const NODE_CATEGORY_ORDER = ["I/O", "Image", "Color", "Channel", "Keyer", "Merge", "Transform", "Filter", "Metadata", "Organization", "Output", "Node"];
@@ -2155,6 +2160,7 @@ export default function App() {
 
         <Inspector
           node={selectedNode}
+          graph={graph}
           metadata={selectedMetadata}
           settings={settings}
           colorConfig={colorConfig}

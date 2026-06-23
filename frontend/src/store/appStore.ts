@@ -154,6 +154,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       name: type,
       position,
       params: defaultParamsFor(type),
+      param_expressions: {},
       inputs: {},
       outputs: { out: "ImageFrame" },
     };
@@ -432,6 +433,28 @@ function defaultParamsFor(type: string): Record<string, unknown> {
         filter: "bilinear",
         clamp: false,
         black_outside: true,
+      };
+    case "FrameHold":
+      return { first_frame: 1001, increment: 0 };
+    case "FrameRange":
+      return { frame_start: 1001, frame_end: 1010, mode: "hold" };
+    case "Retime":
+      return { speed: 1, reverse: false, filter: "linear", src_start: 1001, src_end: 1010, warp_points: [] };
+    case "ColorCorrect":
+      return { saturation: 1, contrast: 1, gamma: 1, gain: 1, offset: 0, mix: 1, clamp: false };
+    case "HueCorrect":
+      return {
+        hue_shift_points: [],
+        sat_points: [],
+        lum_points: [],
+        red_gain_points: [],
+        green_gain_points: [],
+        blue_gain_points: [],
+        red_suppress_points: [],
+        green_suppress_points: [],
+        blue_suppress_points: [],
+        sat_threshold: 0,
+        mix: 1,
       };
     case "Merge":
       return {

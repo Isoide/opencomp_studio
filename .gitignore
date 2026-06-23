@@ -187,3 +187,6 @@ yarn-error.log*
 .cursorindexingignore
 *.err
 /.codex_natron
+/scripts
+/tmp
+/scripts

@@ -305,6 +305,12 @@ function draw(
         ctx.fillText(timing.cache_hit ? "cache" : `${Math.round(timing.duration_ms)}ms`, x + NODE_W - 46, y + 38);
       }
     }
+    if (Object.keys(node.param_expressions ?? {}).length > 0) {
+      ctx.fillStyle = "#77c8b4";
+      ctx.beginPath();
+      ctx.arc(x + NODE_W - 12, y + 9, 4, 0, Math.PI * 2);
+      ctx.fill();
+    }
 
     ctx.fillStyle = "#141414";
     if (node.type.toLowerCase() === "viewer") {

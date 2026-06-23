@@ -6,6 +6,7 @@ export type NodeModel = {
   name?: string | null;
   position: [number, number];
   params: Record<string, unknown>;
+  param_expressions: Record<string, { source: string; enabled: boolean; compiled_cache_key?: string | null }>;
   inputs: Record<string, string>;
   outputs: Record<string, string>;
 };
@@ -161,6 +162,9 @@ export type NodeMetadata = {
   data_window: BBox;
   cryptomatte_layers: CryptomatteLayer[];
   metadata: Record<string, unknown>;
+  resolved_params: Record<string, unknown>;
+  expression_errors: Record<string, string>;
+  bindable_outputs: Record<string, unknown>;
 };
 
 export type BBox = {
@@ -1077,6 +1081,10 @@ export const client = {
   nodeCatalog: () => jsonRequest<NodeCatalogItem[]>("/api/nodes/catalog"),
   nodeMetadata: (nodeId: string, frame: number) =>
     jsonRequest<NodeMetadata>(`/api/nodes/${encodeURIComponent(nodeId)}/metadata?frame=${frame}`),
+  nodeBindings: (nodeId: string, frame: number) =>
+    jsonRequest<{ node_id: string; frame: number; bindable_outputs: Record<string, unknown>; expression_errors: Record<string, string> }>(
+      `/api/nodes/${encodeURIComponent(nodeId)}/bindings?frame=${frame}`,
+    ),
   nodeCryptomatte: (nodeId: string, frame: number) =>
     jsonRequest<{ node_id: string; frame: number; layers: CryptomatteLayer[] }>(
       `/api/nodes/${encodeURIComponent(nodeId)}/cryptomatte?frame=${frame}`,

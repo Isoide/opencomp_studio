@@ -414,6 +414,26 @@ async def node_metadata(request: Request, node_id: str, frame: int | None = None
         "data_window": image.data_window,
         "cryptomatte_layers": [cryptomatte_layer_payload(layer) for layer in cryptomatte_layers(image)],
         "metadata": json_safe(image.metadata),
+        "resolved_params": json_safe(evaluator.resolved_node(active_graph, node_id, frame_number).params),
+        "expression_errors": json_safe(evaluator.expression_errors(active_graph, node_id, frame_number)),
+        "bindable_outputs": json_safe(evaluator.bindable_outputs(active_graph, node_id, frame_number)),
+    }
+
+
+@router.get("/api/nodes/{node_id}/bindings")
+async def node_bindings(request: Request, node_id: str, frame: int | None = None):
+    project = get_project(request)
+    ensure_script_tabs(project)
+    active_graph = get_active_script(project).graph
+    if node_id not in active_graph.nodes:
+        raise HTTPException(status_code=404, detail=f"Unknown node: {node_id}")
+    evaluator = get_evaluator(request, project)
+    frame_number = frame if frame is not None else project.settings.frame_start
+    return {
+        "node_id": node_id,
+        "frame": frame_number,
+        "bindable_outputs": json_safe(evaluator.bindable_outputs(active_graph, node_id, frame_number)),
+        "expression_errors": json_safe(evaluator.expression_errors(active_graph, node_id, frame_number)),
     }
 
 
@@ -1073,6 +1093,17 @@ def _float_preview_payload(project: Project, graph, evaluator: GraphEvaluator, p
     encode_started = time.perf_counter()
     data = _encode_float_rgba(result.entry.rgba, _float_precision(payload))
     encode_ms = (time.perf_counter() - encode_started) * 1000.0
+    evaluator.record_phase_timing(
+        payload.node_id,
+        "viewer.float_encode",
+        encode_ms,
+        {
+            "width": int(result.entry.rgba.shape[1]),
+            "height": int(result.entry.rgba.shape[0]),
+            "dtype": _float_precision(payload),
+            "bytes": len(data),
+        },
+    )
     header = _float_preview_header(payload, result, stream_tiles=False)
     header["tile_encode_ms"] = round(encode_ms, 2)
     return header, data

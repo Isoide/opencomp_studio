@@ -17,12 +17,19 @@ class Edge(BaseModel):
     target_socket: str = "in"
 
 
+class ExpressionBinding(BaseModel):
+    source: str = ""
+    enabled: bool = True
+    compiled_cache_key: str | None = None
+
+
 class Node(BaseModel):
     id: str
     type: str
     name: str | None = None
     position: tuple[float, float] = (0.0, 0.0)
     params: dict[str, Any] = Field(default_factory=dict)
+    param_expressions: dict[str, ExpressionBinding] = Field(default_factory=dict)
     inputs: dict[str, str] = Field(default_factory=dict)
     outputs: dict[str, str] = Field(default_factory=lambda: {"out": "ImageFrame"})
 
