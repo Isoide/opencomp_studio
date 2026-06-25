@@ -31,8 +31,9 @@ print(node.value("path").getValue())
     assert result["success"] is True
     assert result["changed"] is True
     assert "C:/plates/test.####.exr" in result["stdout"]
-
     project = result["project"]
+    assert project["script_tabs"][0]["code"] == code
+
     graph = project["graph"]
     assert project["project_name"] == "test"
     assert project["settings"]["frame_start"] == 1001
@@ -57,3 +58,4 @@ def test_python_script_error_returns_traceback_without_http_failure() -> None:
     assert result["success"] is False
     assert "RuntimeError: boom" in result["error"]
     assert "Traceback" in result["traceback"]
+    assert result["project"]["script_tabs"][0]["code"] == "raise RuntimeError('boom')"

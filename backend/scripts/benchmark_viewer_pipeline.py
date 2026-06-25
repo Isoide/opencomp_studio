@@ -10,7 +10,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from opencomp.api.routes import _float_preview_payload, _render_viewer_png
+from opencomp.api.viewer_float import float_preview_payload
+from opencomp.api.viewer_requests import render_viewer_png
 from opencomp.color.ocio_engine import OCIOColorEngine
 from opencomp.core.evaluator import GraphEvaluator
 from opencomp.core.models import Edge, FrameRequest, Node, Project, ProjectGraph, ProjectSettings
@@ -35,6 +36,13 @@ def main() -> int:
     parser.add_argument("--runs", type=int, default=3, help="Warm runs to average after the cold run.")
     parser.add_argument("--precision", default="float16", choices=["float16", "float32", "rgb10a2", "uint8"], help="Float transport precision.")
     parser.add_argument("--include-huecorrect", action="store_true", help="Include HueCorrect in the benchmark graph.")
+    parser.add_argument("--proxy-enabled", action="store_true", help="Enable proxy resizing in the benchmarked viewer path.")
+    parser.add_argument("--proxy-width", type=int, default=1280, help="Proxy width when proxy is enabled.")
+    parser.add_argument("--proxy-height", type=int, default=720, help="Proxy height when proxy is enabled.")
+    parser.add_argument("--execution-backend", default="auto", choices=["auto", "cpu", "vulkan"], help="Backend execution preference.")
+    parser.add_argument("--image-io-backend", default="auto", choices=["auto", "openexr", "oiio"], help="EXR reader backend preference.")
+    parser.add_argument("--display", help="Viewer display override.")
+    parser.add_argument("--view", help="Viewer view override.")
     parser.add_argument("--quiet", action="store_true", help="Suppress progress logging.")
     parser.add_argument("--output", help="Optional path to write the benchmark JSON report.")
     parser.add_argument("--log-file", help="Optional path to append benchmark progress logs.")
@@ -51,7 +59,20 @@ def main() -> int:
     log = _logger(log_enabled, args.log_file)
     log(f"benchmark input: {concrete_path}")
 
-    project = _build_project(path, args.frame, args.colorspace, args.working_colorspace, args.include_huecorrect)
+    project = _build_project(
+        path,
+        args.frame,
+        args.colorspace,
+        args.working_colorspace,
+        args.include_huecorrect,
+        args.proxy_enabled,
+        args.proxy_width,
+        args.proxy_height,
+        args.execution_backend,
+        args.image_io_backend,
+        args.display,
+        args.view,
+    )
     evaluator = GraphEvaluator(settings=project.settings, max_cache_bytes=1024 * 1024 * 1024)
     payload = FrameRequest(
         node_id="Viewer1",
@@ -81,10 +102,16 @@ def main() -> int:
             "ocio_available": OCIOColorEngine(project.settings.ocio_config).available,
             "viewer_display": project.settings.viewer_display,
             "viewer_view": project.settings.viewer_view,
+            "proxy_enabled": project.settings.proxy_enabled,
+            "viewer_max_width": project.settings.viewer_max_width,
+            "viewer_max_height": project.settings.viewer_max_height,
+            "execution_backend": project.settings.execution_backend,
+            "image_io_backend": project.settings.image_io_backend,
             "graph": [node.type for node in project.graph.nodes.values()],
         },
         "png": _summarize_mode(cold_png, warm_png),
         "float": _summarize_mode(cold_float, warm_float),
+        "cache_status": evaluator.cache_snapshot(),
     }
     report_json = json.dumps(report, indent=2)
     if args.output:
@@ -96,22 +123,39 @@ def main() -> int:
     return 0
 
 
-def _build_project(path: str, frame: int, colorspace: str, working_colorspace: str, include_huecorrect: bool) -> Project:
+def _build_project(
+    path: str,
+    frame: int,
+    colorspace: str,
+    working_colorspace: str,
+    include_huecorrect: bool,
+    proxy_enabled: bool,
+    proxy_width: int,
+    proxy_height: int,
+    execution_backend: str,
+    image_io_backend: str,
+    display_override: str | None,
+    view_override: str | None,
+) -> Project:
     engine = OCIOColorEngine(None)
-    display = engine.default_display()
-    view = engine.default_view(display) if display else None
+    display = display_override or engine.default_display()
+    view = view_override or (engine.default_view(display) if display else None)
     settings = ProjectSettings(
         frame_start=frame,
         frame_end=frame,
         working_colorspace=working_colorspace,
         viewer_display=display,
         viewer_view=view,
-        proxy_enabled=False,
+        proxy_enabled=proxy_enabled,
+        viewer_max_width=proxy_width,
+        viewer_max_height=proxy_height,
         cache_enabled=True,
         tile_rendering_enabled=True,
         tile_workers=4,
         read_workers=4,
         render_workers=4,
+        execution_backend=execution_backend,
+        image_io_backend=image_io_backend,
     )
     graph = ProjectGraph(
         nodes={
@@ -200,7 +244,7 @@ def _run_png_benchmark(
     log(f"[{label}] start png preview")
     phase_start = len(evaluator.phase_timings)
     wall_started = time.perf_counter()
-    png_bytes = _render_viewer_png(project, project.graph, evaluator, payload)
+    png_bytes = render_viewer_png(project, project.graph, evaluator, payload)
     wall_ms = (time.perf_counter() - wall_started) * 1000.0
     metrics = RunMetrics(
         label=label,
@@ -227,7 +271,7 @@ def _run_float_benchmark(
     log(f"[{label}] start float preview payload")
     phase_start = len(evaluator.phase_timings)
     wall_started = time.perf_counter()
-    header, data = _float_preview_payload(project, project.graph, evaluator, payload)
+    header, data = float_preview_payload(project, project.graph, evaluator, payload)
     wall_ms = (time.perf_counter() - wall_started) * 1000.0
     metrics = RunMetrics(
         label=label,
@@ -238,6 +282,13 @@ def _run_float_benchmark(
             "evaluate_ms": float(header.get("node_eval_ms", 0.0) or 0.0),
             "resize_ms": float(header.get("resize_ms", 0.0) or 0.0),
             "float_cache_lookup_ms": float(header.get("float_cache_lookup_ms", 0.0) or 0.0),
+            "execution_backend": header.get("execution_backend", "cpu"),
+            "gpu_kernel_mode": header.get("gpu_kernel_mode", "cpu_fallback"),
+            "gpu_upload_ms": float(header.get("gpu_upload_ms", 0.0) or 0.0),
+            "gpu_dispatch_ms": float(header.get("gpu_dispatch_ms", 0.0) or 0.0),
+            "gpu_download_ms": float(header.get("gpu_download_ms", 0.0) or 0.0),
+            "gpu_resize_ms": float(header.get("gpu_resize_ms", 0.0) or 0.0),
+            "gpu_cache_hit": bool(header.get("gpu_cache_hit", False)),
             "dtype": header.get("dtype"),
             "width": header.get("width"),
             "height": header.get("height"),

@@ -18,6 +18,22 @@ def _install_gradient_viewer(client: TestClient) -> None:
     client.put("/api/graph", json={"graph": graph.model_dump()})
 
 
+def _install_missing_read_viewer(client: TestClient) -> None:
+    client.post("/api/projects/new")
+    graph = ProjectGraph(
+        nodes={
+            "Read1": Node(
+                id="Read1",
+                type="Read",
+                params={"path": "Z:/opencomp-tests/missing_plate.####.exr", "colorspace": "ACES2065-1"},
+            ),
+            "Viewer1": Node(id="Viewer1", type="Viewer", params={"active_input": "0"}),
+        },
+        edges=[Edge(id="read-viewer", source_node="Read1", target_node="Viewer1", target_socket="0")],
+    )
+    client.put("/api/graph", json={"graph": graph.model_dump()})
+
+
 def test_viewer_frame_websocket_returns_png() -> None:
     client = TestClient(app)
     _install_gradient_viewer(client)
@@ -48,6 +64,19 @@ def test_viewer_float_websocket_returns_pre_display_rgba() -> None:
     assert header["byte_length"] == header["width"] * header["height"] * 4 * 4
     assert len(data) == header["byte_length"]
     assert header["colorspace"] == "ACES2065-1"
+
+
+def test_viewer_frame_websocket_returns_structured_node_error() -> None:
+    client = TestClient(app)
+    _install_missing_read_viewer(client)
+
+    with client.websocket_connect("/ws/viewer/frame") as websocket:
+        websocket.send_json({"node_id": "Viewer1", "frame": 1001, "viewer_input": "0"})
+        payload = json.loads(websocket.receive_text())
+
+    assert payload["type"] == "error"
+    assert payload["node_id"] == "Read1"
+    assert payload["kind"] == "node_evaluation_error"
 
 
 def test_viewer_float_websocket_can_stream_float16_tiles() -> None:

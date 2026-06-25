@@ -3,6 +3,7 @@ import { type ChangeEvent, useCallback, useEffect, useMemo, useRef, useState } f
 
 import {
   client,
+  isApiError,
   type CacheStatus,
   type CryptomattePick,
   type FloatViewerFrame,
@@ -11,16 +12,69 @@ import {
   type NodeTiming,
   type OcioGpuShader,
   type Project,
+  type ProjectPreferences,
   type ProjectGraph,
+  type ProjectSettings,
   type PythonScriptResult,
   type RequestTiming,
 } from "./api/client";
 import { Inspector, type InspectorTab } from "./inspector/Inspector";
 import { CanvasNodeGraph } from "./nodegraph/CanvasNodeGraph";
+import { PreferencesDialog } from "./preferences/PreferencesDialog";
+import { ensureNukeExtension, ensureOpenCompExtension, isBackendFilesystemPath, projectWithCurrentGraph } from "./projectFiles";
+import { playbackTransferMode, projectCacheLimitMb, projectHotkeys, readPreloadEnabled, readPreloadMaxFrames, viewerTransferPrecision } from "./projectPreferences";
+import {
+  interactiveBackendWarmFrameLimit,
+  interactiveFrontendWarmFrameLimit,
+  playbackFrontendWarmFrameLimit,
+  playbackWarmFrameCount,
+  projectExecutionBackend,
+  projectFrameEnd,
+  projectFrameStart,
+  viewerTileHeight,
+  viewerTileLanes,
+} from "./projectRuntime";
+import {
+  activeScript,
+  activeScriptId,
+  activeScriptName,
+  clampProjectFrame,
+  projectPath,
+  projectSettingsOrNull,
+  projectWithViewerDefaults,
+  proxyCacheToken,
+  suggestedNukePath,
+  suggestedProjectFilename,
+  suggestedProjectPath,
+  viewerDisplaySelection,
+  viewerSettingsSnapshot,
+  viewerProxySize,
+} from "./projectSettings";
+import {
+  backgroundRuntimeNodeIds as backgroundRuntimeNodeIdsFromStatus,
+  foregroundRuntimeNodeIds as foregroundRuntimeNodeIdsFromStatus,
+  gpuRuntimeAvailable as gpuRuntimeAvailableFromStatus,
+  gpuSupportedNodeTypes as gpuSupportedNodeTypesFromStatus,
+  lastRequestTiming,
+} from "./runtimeStatus";
 import { ScriptEditor } from "./scripting/ScriptEditor";
 import { useAppStore } from "./store/appStore";
+import { cpuPreviewPlan, displayPreviewTransport, viewerCompareInputs, viewerCompareTiming } from "./viewer/viewerCompare";
+import {
+  appendFrontendRequestTiming,
+  buildFrontendViewerRequestTiming,
+  nextFrontendTimingHistory,
+  shouldReuseFrontendCache,
+  viewerResultKind,
+} from "./viewer/viewerResult";
 import { ViewerPanel } from "./viewer/ViewerPanel";
 import { isWebglFloatViewerSupported, type WebglViewerMetrics } from "./viewer/webglFloatViewer";
+import {
+  ocioShaderCacheKey,
+  viewerFrameByteLength,
+  viewerFrameIsFinal,
+  viewerFrameTransport,
+} from "./viewer/viewerFrame";
 
 const ADDABLE_NODES = [
   "Read",
@@ -70,8 +124,11 @@ node.setPosition(280, 120)
 root = opencomp.node("root")
 root.value("name").setValue("test")
 `;
-type ViewerTool = "pan" | "crypto-add" | "crypto-remove" | "point" | "spline";
+type ViewerTool = "pan" | "crypto-add" | "crypto-remove" | "point" | "spline" | "roi";
+type ViewerRoi = { x: number; y: number; width: number; height: number };
 type ViewerCompareMode = "wipe" | "difference";
+type ViewerProfilePreset = "speed" | "quality" | "custom";
+type ViewerErrorState = { message: string; nodeId: string | null };
 type FrontendViewerCacheEntry = {
   frame: FloatViewerFrame;
   bytes: number;
@@ -102,6 +159,44 @@ type WindowWithSavePicker = Window & {
   }) => Promise<FileSystemFileHandleLike>;
 };
 
+const SPEED_VIEWER_PRESET = {
+  settings: {
+    proxy_enabled: true,
+    viewer_max_width: 1280,
+    viewer_max_height: 720,
+  } satisfies Partial<ProjectSettings>,
+  preferences: {
+    playback_transfer_mode: "hybrid-preview",
+    viewer_transfer_precision: "float16",
+  } satisfies Partial<ProjectPreferences>,
+};
+
+const QUALITY_VIEWER_PRESET = {
+  settings: {
+    proxy_enabled: false,
+  } satisfies Partial<ProjectSettings>,
+  preferences: {
+    playback_transfer_mode: "hybrid-preview",
+    viewer_transfer_precision: "float16",
+  } satisfies Partial<ProjectPreferences>,
+};
+
+function resolveViewerProfilePreset(
+  settings: ProjectSettings | null | undefined,
+  preferences: ProjectPreferences | null | undefined,
+): ViewerProfilePreset {
+  if (!settings || !preferences) return "custom";
+  const sharedTransport =
+    preferences.playback_transfer_mode === "hybrid-preview" && preferences.viewer_transfer_precision === "float16";
+  if (sharedTransport && settings.proxy_enabled && settings.viewer_max_width === 1280 && settings.viewer_max_height === 720) {
+    return "speed";
+  }
+  if (sharedTransport && !settings.proxy_enabled) {
+    return "quality";
+  }
+  return "custom";
+}
+
 export default function App() {
   const {
     backendStatus,
@@ -125,6 +220,7 @@ export default function App() {
     setBackendStatus,
     setColorConfig,
     setFrame,
+    setGraph,
     setPlaying,
     setProject,
     setRendering,
@@ -139,6 +235,7 @@ export default function App() {
   const [showPreferences, setShowPreferences] = useState(false);
   const [showScriptEditor, setShowScriptEditor] = useState(false);
   const [scriptEditorCode, setScriptEditorCode] = useState(DEFAULT_PYTHON_SCRIPT);
+  const [scriptEditorDrafts, setScriptEditorDrafts] = useState<Record<string, string>>({});
   const [scriptOutput, setScriptOutput] = useState("");
   const [isRunningScript, setRunningScript] = useState(false);
   const [nodeCatalog, setNodeCatalog] = useState<NodeCatalogItem[]>([]);
@@ -146,8 +243,10 @@ export default function App() {
   const [nodePaletteQuery, setNodePaletteQuery] = useState("");
   const [nodePaletteIndex, setNodePaletteIndex] = useState(0);
   const [lastGraphPosition, setLastGraphPosition] = useState<[number, number]>([220, 180]);
-  const [activeRuntimeNodeIds, setActiveRuntimeNodeIds] = useState<string[]>([]);
+  const [foregroundRuntimeNodeIds, setForegroundRuntimeNodeIds] = useState<string[]>([]);
+  const [backgroundRuntimeNodeIds, setBackgroundRuntimeNodeIds] = useState<string[]>([]);
   const [nodeTimings, setNodeTimings] = useState<Record<string, NodeTiming>>({});
+  const [nodeErrors, setNodeErrors] = useState<Record<string, string>>({});
   const [metricsStatus, setMetricsStatus] = useState<CacheStatus | null>(null);
   const [frontendRequestTimings, setFrontendRequestTimings] = useState<RequestTiming[]>([]);
   const [frontendFrameMs, setFrontendFrameMs] = useState<number | null>(null);
@@ -161,6 +260,7 @@ export default function App() {
   const [compareViewerGpuFrame, setCompareViewerGpuFrame] = useState<FloatViewerFrame | null>(null);
   const [ocioGpuShader, setOcioGpuShader] = useState<OcioGpuShader | null>(null);
   const [viewerGpuMetrics, setViewerGpuMetrics] = useState<WebglViewerMetrics | null>(null);
+  const [viewerError, setViewerError] = useState<ViewerErrorState | null>(null);
   const [viewerGain, setViewerGain] = useState(1);
   const [viewerSaturation, setViewerSaturation] = useState(1);
   const [viewerFstop, setViewerFstop] = useState(0);
@@ -171,6 +271,7 @@ export default function App() {
   const [wipePosition, setWipePosition] = useState(0.5);
   const [wipeAngle, setWipeAngle] = useState(0);
   const [viewerTool, setViewerTool] = useState<ViewerTool>("pan");
+  const [viewerRoi, setViewerRoi] = useState<ViewerRoi | null>(null);
   const [cryptoLayer, setCryptoLayer] = useState("");
   const [cryptoSelection, setCryptoSelection] = useState<CryptomattePick[]>([]);
   const [cryptoPreviewEnabled, setCryptoPreviewEnabled] = useState(false);
@@ -186,9 +287,11 @@ export default function App() {
   const skipNextAutoRefreshRef = useRef(false);
   const lastCompletedAutoRefreshKeyRef = useRef<string | null>(null);
   const firstVisibleFrameRequestRef = useRef<{ key: string; attempts: number }>({ key: "", attempts: 0 });
+  const immediateWarmKeyRef = useRef("");
   const idlePrefetchTimerRef = useRef<number | null>(null);
   const idlePrefetchControllerRef = useRef<AbortController | null>(null);
   const idlePrefetchSessionRef = useRef(0);
+  const viewerErrorRef = useRef<ViewerErrorState | null>(null);
   const frontendTimingRef = useRef<{ lastMs: number | null; history: number[] }>({ lastMs: null, history: [] });
   const ocioGpuShaderRef = useRef<{ key: string; shader: OcioGpuShader | null } | null>(null);
   const gpuFallbackLoggedRef = useRef(false);
@@ -204,6 +307,9 @@ export default function App() {
   const viewerRenderRequestIdRef = useRef(0);
   const lastCacheStatusRef = useRef<CacheStatus | null>(null);
   const renderRevisionRef = useRef(renderRevision);
+  const previousScriptTabIdRef = useRef<string | null>(null);
+  const settings = projectSettingsOrNull(project);
+  const preferences = project?.preferences ?? null;
   const latestRef = useRef({
     frame,
     graph,
@@ -220,6 +326,7 @@ export default function App() {
     viewerCompareMode,
     viewerCompareInputA,
     viewerCompareInputB,
+    viewerRoi,
     isPlaying,
     viewerNodeId: "Viewer1",
     viewerUrl,
@@ -234,10 +341,56 @@ export default function App() {
     () => Object.values(graph?.nodes ?? {}).find((node) => node.type.toLowerCase() === "viewer")?.id ?? "Viewer1",
     [graph],
   );
+  const latestFrontendViewerTiming = useMemo(
+    () =>
+      [...frontendRequestTimings]
+        .reverse()
+        .find((timing) => timing.type === "frontend_viewer_frame" && timing.node_id === viewerNodeId) ?? null,
+    [frontendRequestTimings, viewerNodeId],
+  );
 
-  const activeScriptName = useMemo(
-    () => project?.script_tabs.find((tab) => tab.id === project.active_script_id)?.name ?? null,
-    [project?.active_script_id, project?.script_tabs],
+  const currentActiveScriptName = useMemo(() => activeScriptName(project), [project]);
+
+  const primeScriptEditorState = useCallback((nextProject: Project) => {
+    const nextDrafts = Object.fromEntries(
+      nextProject.script_tabs.map((tab) => [tab.id, tab.code || DEFAULT_PYTHON_SCRIPT]),
+    ) as Record<string, string>;
+    setScriptEditorDrafts(nextDrafts);
+    const nextActiveScriptId = activeScriptId(nextProject);
+    const activeTab = activeScript(nextProject);
+    setScriptEditorCode(activeTab?.code || DEFAULT_PYTHON_SCRIPT);
+    setScriptOutput("");
+    previousScriptTabIdRef.current = nextActiveScriptId;
+  }, []);
+
+  useEffect(() => {
+    if (!project?.script_tabs.length) {
+      previousScriptTabIdRef.current = null;
+      return;
+    }
+    setScriptEditorDrafts((current) => {
+      const next = { ...current };
+      let changed = false;
+      for (const tab of project.script_tabs) {
+        if (next[tab.id] == null) {
+          next[tab.id] = tab.code || DEFAULT_PYTHON_SCRIPT;
+          changed = true;
+        }
+      }
+      return changed ? next : current;
+    });
+    const nextActiveScriptId = activeScriptId(project);
+    if (!nextActiveScriptId) return;
+    if (previousScriptTabIdRef.current !== nextActiveScriptId) {
+      const activeTab = activeScript(project);
+      setScriptEditorCode(scriptEditorDrafts[nextActiveScriptId] ?? activeTab?.code ?? DEFAULT_PYTHON_SCRIPT);
+      setScriptOutput("");
+      previousScriptTabIdRef.current = nextActiveScriptId;
+    }
+  }, [project?.active_script_id, project?.script_tabs, scriptEditorDrafts]);
+  const viewerProfilePreset = useMemo(
+    () => resolveViewerProfilePreset(settings, preferences),
+    [preferences, settings],
   );
 
   const paletteNodes = useMemo(() => {
@@ -270,12 +423,34 @@ export default function App() {
     });
   }, [nodeCatalog]);
 
+  const gpuSupportedNodeTypes = useMemo(
+    () => gpuSupportedNodeTypesFromStatus(metricsStatus),
+    [metricsStatus],
+  );
+
+  const gpuRuntimeAvailable = gpuRuntimeAvailableFromStatus(metricsStatus);
+
   const availableViewerChannels = useMemo(() => {
     const channels = viewerMetadata?.channels?.length ? viewerMetadata.channels : DEFAULT_VIEWER_CHANNELS;
     return [...new Set([viewerChannel, ...DEFAULT_VIEWER_CHANNELS, ...channels])];
   }, [viewerChannel, viewerMetadata?.channels]);
 
   const cryptomatteLayers = useMemo(() => viewerMetadata?.cryptomatte_layers ?? [], [viewerMetadata?.cryptomatte_layers]);
+
+  const applyViewerProfilePreset = useCallback(
+    (profile: Exclude<ViewerProfilePreset, "custom">) => {
+      const preset = profile === "speed" ? SPEED_VIEWER_PRESET : QUALITY_VIEWER_PRESET;
+      updateProjectSettings(preset.settings);
+      updatePreferences(preset.preferences);
+      addLog(
+        "info",
+        profile === "speed"
+          ? "Viewer preset set to Speed: 1280x720 proxy with half-float cached transport."
+          : "Viewer preset set to Quality: full-resolution viewer path with half-float cached transport.",
+      );
+    },
+    [addLog, updatePreferences, updateProjectSettings],
+  );
 
   useEffect(() => {
     renderRevisionRef.current = renderRevision;
@@ -295,6 +470,7 @@ export default function App() {
       viewerCompareMode,
       viewerCompareInputA,
       viewerCompareInputB,
+      viewerRoi,
       isPlaying,
       viewerNodeId,
       viewerUrl,
@@ -316,9 +492,42 @@ export default function App() {
     viewerFstop,
     viewerGain,
     viewerNodeId,
+    viewerRoi,
     viewerSaturation,
     viewerUrl,
   ]);
+
+  const clearViewerError = useCallback(() => {
+    viewerErrorRef.current = null;
+    setViewerError(null);
+  }, []);
+
+  const reportViewerError = useCallback(
+    (error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      const nodeId = isApiError(error) ? error.nodeId : null;
+      viewerErrorRef.current = { message, nodeId };
+      if (idlePrefetchTimerRef.current !== null) {
+        window.clearTimeout(idlePrefetchTimerRef.current);
+        idlePrefetchTimerRef.current = null;
+      }
+      idlePrefetchControllerRef.current?.abort();
+      idlePrefetchControllerRef.current = null;
+      abortRef.current?.abort();
+      immediateWarmKeyRef.current = "";
+      firstVisibleFrameRequestRef.current = { key: "", attempts: 0 };
+      setViewerError({ message, nodeId });
+      if (nodeId) {
+        setNodeErrors((current) => ({ ...current, [nodeId]: message }));
+      }
+      setPlaybackStatus(null);
+      setRendering(false);
+      if (latestRef.current.isPlaying) {
+        setPlaying(false);
+      }
+    },
+    [setPlaying, setRendering],
+  );
 
   const refreshCacheStatusLabel = useCallback(
     (status = lastCacheStatusRef.current) => {
@@ -327,7 +536,7 @@ export default function App() {
       const viewerTimingLabel = viewerTiming
         ? ` | viewer ${viewerTiming.cache_hit ? "cache" : `${Math.round(viewerTiming.total_ms)}ms`}`
         : "";
-      const requestTiming = status.last_request_timing;
+      const requestTiming = lastRequestTiming(status);
       const requestTimingLabel = requestTiming
         ? ` | backend ${Math.round(requestTiming.total_ms)}ms/${requestTiming.transport}`
         : "";
@@ -356,14 +565,26 @@ export default function App() {
       const status = await client.cacheStatus();
       lastCacheStatusRef.current = status;
       setMetricsStatus(status);
-      setActiveRuntimeNodeIds(status.active_nodes);
+      setForegroundRuntimeNodeIds(foregroundRuntimeNodeIdsFromStatus(status));
+      setBackgroundRuntimeNodeIds(backgroundRuntimeNodeIdsFromStatus(status));
       setNodeTimings(status.node_timings);
+      setNodeErrors((current) => {
+        const backendErrors = Object.fromEntries(
+          Object.entries(status.node_errors ?? {}).map(([nodeId, detail]) => [nodeId, detail.message]),
+        );
+        if (Object.keys(backendErrors).length > 0) {
+          return backendErrors;
+        }
+        return viewerErrorRef.current?.nodeId ? current : {};
+      });
       setCachedFrames(viewerReadyCachedFrames(frontendViewerCacheRef.current, latestRef.current, renderRevisionRef.current));
       refreshCacheStatusLabel(status);
     } catch {
       setCacheStatus("cache: unavailable");
       setCachedFrames([]);
       setMetricsStatus(null);
+      setForegroundRuntimeNodeIds([]);
+      setBackgroundRuntimeNodeIds([]);
     }
   }, [refreshCacheStatusLabel]);
 
@@ -416,22 +637,21 @@ export default function App() {
           const catalog = await client.nodeCatalog();
           if (cancelled) return;
           setNodeCatalog(catalog);
-          const newProject = await client.newProject();
+          const currentProject = await client.currentProject();
           if (cancelled) return;
           const config = await loadColorConfig();
           if (cancelled) return;
-          const settings = {
-            ...newProject.settings,
-            viewer_display: newProject.settings.viewer_display ?? config.default_display,
-            viewer_view: newProject.settings.viewer_view ?? config.default_view,
-          };
-          await client.putProjectSettings(settings);
+          const hydratedProject = projectWithViewerDefaults(currentProject, config);
+          if (JSON.stringify(hydratedProject.settings) !== JSON.stringify(currentProject.settings)) {
+            await client.putProjectSettings(hydratedProject.settings);
+          }
           if (cancelled) return;
-          setProject({ ...newProject, settings });
-          lastSyncedSettingsRef.current = JSON.stringify(settings);
-          lastSyncedGraphRef.current = JSON.stringify(newProject.graph);
+          primeScriptEditorState(hydratedProject);
+          setProject(hydratedProject);
+          lastSyncedSettingsRef.current = JSON.stringify(hydratedProject.settings);
+          lastSyncedGraphRef.current = JSON.stringify(currentProject.graph);
           await loadCacheStatus();
-          if (!cancelled) addLog("info", "Backend connected and reference sequence project loaded.");
+          if (!cancelled) addLog("info", "Backend connected and existing session loaded.");
           return;
         } catch (error) {
           lastError = error;
@@ -445,15 +665,23 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [addLog, loadCacheStatus, loadColorConfig, setBackendStatus, setProject]);
+  }, [addLog, loadCacheStatus, loadColorConfig, primeScriptEditorState, setBackendStatus, setProject]);
 
   useEffect(() => {
     if (!project) return;
     void loadColorConfig();
-  }, [loadColorConfig, project?.settings.ocio_config, project?.settings.viewer_display]);
+  }, [loadColorConfig, settings?.ocio_config, settings?.viewer_display]);
+
+  useEffect(() => {
+    viewerErrorRef.current = viewerError;
+  }, [viewerError]);
 
   useEffect(() => {
     if (!selectedNodeId) {
+      setSelectedMetadata(null);
+      return;
+    }
+    if (viewerError) {
       setSelectedMetadata(null);
       return;
     }
@@ -471,10 +699,14 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [frame, renderRevision, selectedNodeId]);
+  }, [frame, renderRevision, selectedNodeId, viewerError]);
 
   useEffect(() => {
     if (!graph || !viewerNodeId) {
+      setViewerMetadata(null);
+      return;
+    }
+    if (viewerError) {
       setViewerMetadata(null);
       return;
     }
@@ -491,7 +723,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [frame, graph, renderRevision, viewerNodeId]);
+  }, [frame, graph, renderRevision, viewerError, viewerNodeId]);
 
   useEffect(() => {
     if (cryptomatteLayers.length === 0) {
@@ -527,6 +759,7 @@ export default function App() {
     (frameNumber = latestRef.current.frame) => {
       const current = latestRef.current;
       const settings = current.project?.settings;
+      const viewerSettings = viewerSettingsSnapshot(settings);
       return JSON.stringify({
         frame: frameNumber,
         renderRevision,
@@ -543,14 +776,15 @@ export default function App() {
         viewerCompareMode: current.viewerCompareMode,
         viewerCompareInputA: current.viewerCompareInputA,
         viewerCompareInputB: current.viewerCompareInputB,
-        viewerDisplay: settings?.viewer_display ?? null,
-        viewerView: settings?.viewer_view ?? null,
-        proxyEnabled: settings?.proxy_enabled ?? false,
-        viewerMaxWidth: settings?.viewer_max_width ?? null,
-        viewerMaxHeight: settings?.viewer_max_height ?? null,
+        viewerDisplay: viewerSettings.display,
+        viewerView: viewerSettings.view,
+        proxyEnabled: viewerSettings.proxyEnabled,
+        viewerMaxWidth: viewerSettings.width,
+        viewerMaxHeight: viewerSettings.height,
         tileRenderingEnabled: settings?.tile_rendering_enabled ?? false,
         tileHeight: settings?.tile_height ?? null,
         tileWorkers: settings?.tile_workers ?? null,
+        viewerRoi,
         cryptoLayer: current.cryptoLayer,
         cryptoPreviewEnabled: current.cryptoPreviewEnabled,
         cryptoSelection: current.cryptoSelection.map((selection) => selection.id).sort(),
@@ -566,9 +800,8 @@ export default function App() {
         ocioGpuShaderRef.current = null;
         return null;
       }
-      const display = latestRef.current.project?.settings.viewer_display ?? null;
-      const view = latestRef.current.project?.settings.viewer_view ?? null;
-      const key = `${frameData.header.colorspace}|${display ?? ""}|${view ?? ""}`;
+      const { display, view } = viewerDisplaySelection(projectSettingsOrNull(latestRef.current.project));
+      const key = ocioShaderCacheKey(frameData, display, view);
       if (ocioGpuShaderRef.current?.key === key) {
         return ocioGpuShaderRef.current.shader;
       }
@@ -618,6 +851,7 @@ export default function App() {
         frameNumber,
         snapshot.viewerChannel,
         viewerInput,
+        snapshot.viewerRoi ?? null,
       );
       const cacheLookupStarted = performance.now();
       const cachedFrame = getFrontendViewerFrame(frontendViewerCacheRef.current, cacheKey);
@@ -642,21 +876,25 @@ export default function App() {
       if (inFlight) return inFlight;
 
       const requestPromise = (async () => {
-        const settings = snapshot.project!.settings;
-        const viewerPrecision = snapshot.project!.preferences.viewer_transfer_precision ?? "float16";
+      const snapshotProject = snapshot.project!;
+      const settings = snapshotProject.settings;
+      const viewerSettings = viewerSettingsSnapshot(settings);
+      const viewerPrecision = viewerTransferPrecision(snapshotProject);
         const frameData = await client.viewerFloatFrameStream(
           snapshot.viewerNodeId,
           frameNumber,
-          settings.viewer_display,
-          settings.viewer_view,
+          viewerSettings.display,
+          viewerSettings.view,
           snapshot.viewerChannel,
           signal,
           {
             ...(viewerInput === null ? {} : { viewerInput }),
             precision: viewerPrecision,
-            tileHeight: settings.tile_height ?? 128,
-            tileLanes: Math.max(1, Math.min(Math.round(settings.viewer_tile_lanes ?? 1), 8)),
+            streamTiles: snapshot.viewerRoi ? false : undefined,
+            tileHeight: viewerTileHeight(settings),
+            tileLanes: viewerTileLanes(settings),
             transferMode: transferModeForPrecision(viewerPrecision),
+            roi: snapshot.viewerRoi ?? null,
           },
           onProgress,
         );
@@ -686,18 +924,21 @@ export default function App() {
     frontendViewerInflightRef.current.clear();
     lastCompletedAutoRefreshKeyRef.current = null;
     firstVisibleFrameRequestRef.current = { key: "", attempts: 0 };
+    immediateWarmKeyRef.current = "";
   }, []);
 
   const scheduleReadPreload = useCallback(
     (frames: number[], snapshot: typeof latestRef.current) => {
+      if (viewerErrorRef.current) return;
       const snapshotProject = snapshot.project;
-      if (!snapshotProject || !snapshotProject.preferences.read_preload_enabled || frames.length === 0) return;
-      const maxFrames = Math.max(1, Math.round(snapshotProject.preferences.read_preload_max_frames ?? 6));
+      if (!snapshotProject || !readPreloadEnabled(snapshotProject) || frames.length === 0) return;
+      const maxFrames = readPreloadMaxFrames(snapshotProject);
       const boundedFrames = [
-        ...new Set(frames.map((value) => clampFrame(value, snapshotProject.settings.frame_start, snapshotProject.settings.frame_end))),
+        ...new Set(frames.map((value) => clampFrame(value, projectFrameStart(snapshotProject.settings), projectFrameEnd(snapshotProject.settings)))),
       ].slice(0, maxFrames);
-      const inputs = snapshot.viewerCompareEnabled ? [snapshot.viewerCompareInputA, snapshot.viewerCompareInputB] : [null];
+      const inputs = viewerCompareInputs(snapshot.viewerCompareEnabled, snapshot.viewerCompareInputA, snapshot.viewerCompareInputB);
       for (const viewerInput of inputs) {
+        if (viewerErrorRef.current) return;
         void client
           .warmReadFrames(snapshot.viewerNodeId, boundedFrames, { viewerInput, channel: snapshot.viewerChannel })
           .catch((error) => {
@@ -710,219 +951,317 @@ export default function App() {
     [addLog],
   );
 
+  const startInteractiveWarm = useCallback(
+    (anchorFrame: number, snapshot: typeof latestRef.current, signal: AbortSignal) => {
+      if (
+        !snapshot.graph ||
+        !snapshot.project ||
+        snapshot.cryptoPreviewEnabled ||
+        snapshot.isPlaying ||
+        signal.aborted ||
+        viewerErrorRef.current
+      )
+        return;
+
+      const warmKey = `${currentRenderKey(anchorFrame)}:interactive`;
+      if (immediateWarmKeyRef.current === warmKey) return;
+      immediateWarmKeyRef.current = warmKey;
+
+      const settings = snapshot.project.settings;
+      const viewerSettings = viewerSettingsSnapshot(settings);
+      const preloadFrames = readPreloadFrameOrder(
+        anchorFrame,
+        projectFrameStart(settings),
+        projectFrameEnd(settings),
+        readPreloadMaxFrames(snapshot.project),
+      ).filter((frameToWarm) => frameToWarm !== anchorFrame);
+      if (preloadFrames.length > 0) {
+        scheduleReadPreload(preloadFrames, snapshot);
+      }
+
+      if (!isWebglFloatViewerSupported()) return;
+      const playbackMode = playbackTransferMode(snapshot.project);
+      if (playbackMode === "fast-display") return;
+
+      const warmFrames = idlePrefetchFrameOrder(anchorFrame, projectFrameStart(settings), projectFrameEnd(settings)).slice(
+        0,
+        interactiveBackendWarmFrameLimit(settings),
+      );
+      if (warmFrames.length === 0) return;
+
+      const display = viewerSettings.display;
+      const view = viewerSettings.view;
+      const channel = snapshot.viewerChannel;
+      const inputs = viewerCompareInputs(snapshot.viewerCompareEnabled, snapshot.viewerCompareInputA, snapshot.viewerCompareInputB);
+
+      for (const viewerInput of inputs) {
+        if (signal.aborted || viewerErrorRef.current) return;
+        void client.warmViewerFrames(snapshot.viewerNodeId, warmFrames, { viewerInput, display, view, channel }).catch((error) => {
+          if (!(error instanceof DOMException && error.name === "AbortError")) {
+            addLog("error", `Backend warm failed: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        });
+      }
+
+      const frontendWarmFrames = warmFrames.slice(0, interactiveFrontendWarmFrameLimit(settings));
+      for (const viewerInput of inputs) {
+        for (const frameToWarm of frontendWarmFrames) {
+          if (signal.aborted || viewerErrorRef.current) return;
+          void requestCachedFloatFrame(frameToWarm, viewerInput, signal, snapshot)
+            .then(() => {
+              if (signal.aborted || viewerErrorRef.current) return;
+              setCachedFrames(viewerReadyCachedFrames(frontendViewerCacheRef.current, latestRef.current, renderRevisionRef.current));
+              refreshCacheStatusLabel();
+            })
+            .catch((error) => {
+              if (!(error instanceof DOMException && error.name === "AbortError")) {
+                addLog("error", `Browser warm failed: ${error instanceof Error ? error.message : String(error)}`);
+              }
+            });
+        }
+      }
+    },
+    [addLog, currentRenderKey, refreshCacheStatusLabel, requestCachedFloatFrame, scheduleReadPreload],
+  );
+
   const renderViewerFrame = useCallback(
     async (frameNumber: number, controller: AbortController) => {
       const current = latestRef.current;
       if (!current.graph || !current.project) return false;
-      const requestId = ++viewerRenderRequestIdRef.current;
-      const isCurrentRequest = () => !controller.signal.aborted && viewerRenderRequestIdRef.current === requestId;
+      try {
+        const requestId = ++viewerRenderRequestIdRef.current;
+        const isCurrentRequest = () => !controller.signal.aborted && viewerRenderRequestIdRef.current === requestId;
 
-      await syncGraphAndSettings();
-      const latest = latestRef.current;
-      if (!latest.project || !isCurrentRequest()) return false;
+        await syncGraphAndSettings();
+        const latest = latestRef.current;
+        if (!latest.project || !isCurrentRequest()) return false;
 
-      const selectedMatteIds = latest.cryptoSelection.map((selection) => selection.id);
-      const proxyWidth = latest.project.settings.proxy_enabled ? latest.project.settings.viewer_max_width : null;
-      const proxyHeight = latest.project.settings.proxy_enabled ? latest.project.settings.viewer_max_height : null;
-      const viewerProcessOptions = {
-        gain: latest.viewerGain,
-        saturation: latest.viewerSaturation,
-        fstop: latest.viewerFstop,
-      };
-      const requestViewerFrame = (
-        viewerInputOptions: Parameters<typeof client.viewerFrame>[6] = {},
-      ) =>
-        client
-          .viewerFrameStream(
-            latest.viewerNodeId,
-            frameNumber,
-            latest.project!.settings.viewer_display,
-            latest.project!.settings.viewer_view,
-            latest.viewerChannel,
-            controller.signal,
-            viewerInputOptions,
-          )
-          .catch((error) => {
-            if (error instanceof DOMException && error.name === "AbortError") throw error;
-            return client.viewerFrame(
+        const selectedMatteIds = latest.cryptoSelection.map((selection) => selection.id);
+        const renderSettings = latest.project.settings;
+        const proxySize = viewerProxySize(renderSettings);
+        const viewerSettings = viewerSettingsSnapshot(renderSettings);
+        const proxyWidth = proxySize.width;
+        const proxyHeight = proxySize.height;
+        const viewerProcessOptions = {
+          gain: latest.viewerGain,
+          saturation: latest.viewerSaturation,
+          fstop: latest.viewerFstop,
+        };
+        const requestViewerFrame = (
+          viewerInputOptions: Parameters<typeof client.viewerFrame>[6] = {},
+        ) =>
+          client
+            .viewerFrameStream(
               latest.viewerNodeId,
               frameNumber,
-              latest.project!.settings.viewer_display,
-              latest.project!.settings.viewer_view,
+              viewerSettings.display,
+              viewerSettings.view,
               latest.viewerChannel,
               controller.signal,
               viewerInputOptions,
-            );
-          });
-      const requestFloatFrame = (viewerInput: string | null = null, onProgress?: (frame: FloatViewerFrame) => void) =>
-        requestCachedFloatFrame(frameNumber, viewerInput, controller.signal, latest, onProgress);
-      const requestCpuPreview = async () => {
-        if (latest.viewerCompareEnabled && latest.viewerCompareMode === "difference") {
-          return {
-            blob: await requestViewerFrame({
-              ...viewerProcessOptions,
-              viewerInput: latest.viewerCompareInputA,
-              compareInput: latest.viewerCompareInputB,
-              compareMode: "difference",
-            }),
-            compareBlob: null,
-          };
+            )
+            .catch((error) => {
+              if (error instanceof DOMException && error.name === "AbortError") throw error;
+              if (isApiError(error)) throw error;
+              return client.viewerFrame(
+                latest.viewerNodeId,
+                frameNumber,
+                viewerSettings.display,
+                viewerSettings.view,
+                latest.viewerChannel,
+                controller.signal,
+                viewerInputOptions,
+              );
+            });
+        const requestFloatFrame = (viewerInput: string | null = null, onProgress?: (frame: FloatViewerFrame) => void) =>
+          requestCachedFloatFrame(frameNumber, viewerInput, controller.signal, latest, onProgress);
+        const requestCpuPreview = async () => {
+          const plan = cpuPreviewPlan(
+            latest.viewerCompareEnabled,
+            latest.viewerCompareMode,
+            latest.viewerCompareInputA,
+            latest.viewerCompareInputB,
+            viewerProcessOptions,
+          );
+          if (plan.kind === "compare") {
+            const [nextBlob, nextCompareBlob] = await Promise.all([
+              requestViewerFrame(plan.primary),
+              requestViewerFrame(plan.compare),
+            ]);
+            return { blob: nextBlob, compareBlob: nextCompareBlob };
+          }
+          return { blob: await requestViewerFrame(plan.primary), compareBlob: null };
+        };
+        let blob: Blob | null = null;
+        let compareBlob: Blob | null = null;
+        let nextGpuFrame: FloatViewerFrame | null = null;
+        let nextGpuCompareFrame: FloatViewerFrame | null = null;
+        let frontendTransport = "browser";
+        let payloadBytes = 0;
+        let servedFromFrontendViewerCache = false;
+        let partialShaderRequested = false;
+        let clientFrameMetrics: FloatViewerFrame["metrics"] | null = null;
+        const playbackMode = playbackTransferMode(latest.project);
+        const useDisplayPreviewForPlayback = latest.isPlaying && playbackMode === "fast-display";
+        const publishPartialFrame = (partialFrame: FloatViewerFrame) => {
+          if (!isCurrentRequest() || latest.viewerCompareEnabled) return;
+          if (!partialShaderRequested) {
+            partialShaderRequested = true;
+            void loadOcioGpuShader(partialFrame, controller.signal);
+          }
+          if (latestRef.current.frame !== frameNumber) setFrame(frameNumber);
+          setViewerUrl(null);
+          setCompareViewerUrl(null);
+          setViewerGpuFrame(partialFrame);
+          setCompareViewerGpuFrame(null);
+        };
+        const frontendStarted = performance.now();
+        if (latest.cryptoPreviewEnabled && latest.cryptoLayer) {
+          blob = await client.cryptomatteMatte(
+            latest.viewerNodeId,
+            frameNumber,
+            latest.cryptoLayer,
+            selectedMatteIds,
+            proxyWidth,
+            proxyHeight,
+            controller.signal,
+          );
+          payloadBytes = blob.size;
+        } else {
+          if (!useDisplayPreviewForPlayback && isWebglFloatViewerSupported()) {
+            try {
+              if (latest.viewerCompareEnabled) {
+                const [frameA, frameB] = await Promise.all([
+                  requestFloatFrame(latest.viewerCompareInputA),
+                  requestFloatFrame(latest.viewerCompareInputB),
+                ]);
+                nextGpuFrame = frameA.frame;
+                nextGpuCompareFrame = frameB.frame;
+                payloadBytes = frameA.bytes + frameB.bytes;
+                servedFromFrontendViewerCache = frameA.frontendCacheHit && frameB.frontendCacheHit;
+                clientFrameMetrics = combineFrameMetrics(frameA.frame.metrics, frameB.frame.metrics);
+              } else {
+                const frameData = await requestFloatFrame(null, publishPartialFrame);
+                nextGpuFrame = frameData.frame;
+                payloadBytes = frameData.bytes;
+                servedFromFrontendViewerCache = frameData.frontendCacheHit;
+                clientFrameMetrics = frameData.frame.metrics ?? null;
+              }
+              if (nextGpuFrame && isCurrentRequest()) {
+                await loadOcioGpuShader(nextGpuFrame, controller.signal);
+                frontendTransport = servedFromFrontendViewerCache ? "browser-float-cache" : viewerFrameTransport(nextGpuFrame);
+              }
+            } catch (error) {
+              if (error instanceof DOMException && error.name === "AbortError") throw error;
+              if (!gpuFallbackLoggedRef.current) {
+                gpuFallbackLoggedRef.current = true;
+                addLog("error", `GPU float viewer fallback: ${error instanceof Error ? error.message : String(error)}`);
+              }
+              nextGpuFrame = null;
+              nextGpuCompareFrame = null;
+            }
+          }
+          if (!nextGpuFrame) {
+            const cpuPreview = await requestCpuPreview();
+            blob = cpuPreview.blob;
+            compareBlob = cpuPreview.compareBlob;
+            payloadBytes = blob.size + (compareBlob?.size ?? 0);
+            if (useDisplayPreviewForPlayback) {
+              frontendTransport = displayPreviewTransport(playbackMode);
+            }
+          }
         }
-        if (latest.viewerCompareEnabled && latest.viewerCompareMode === "wipe") {
-          const [nextBlob, nextCompareBlob] = await Promise.all([
-            requestViewerFrame({ ...viewerProcessOptions, viewerInput: latest.viewerCompareInputA }),
-            requestViewerFrame({ ...viewerProcessOptions, viewerInput: latest.viewerCompareInputB }),
-          ]);
-          return { blob: nextBlob, compareBlob: nextCompareBlob };
-        }
-        return { blob: await requestViewerFrame(viewerProcessOptions), compareBlob: null };
-      };
-      let blob: Blob | null = null;
-      let compareBlob: Blob | null = null;
-      let nextGpuFrame: FloatViewerFrame | null = null;
-      let nextGpuCompareFrame: FloatViewerFrame | null = null;
-      let frontendTransport = "browser";
-      let payloadBytes = 0;
-      let servedFromFrontendViewerCache = false;
-      let partialShaderRequested = false;
-      let clientFrameMetrics: FloatViewerFrame["metrics"] | null = null;
-      const playbackTransferMode = latest.project.preferences.playback_transfer_mode ?? "hybrid-preview";
-      const useDisplayPreviewForPlayback = latest.isPlaying && playbackTransferMode === "fast-display";
-      const publishPartialFrame = (partialFrame: FloatViewerFrame) => {
-        if (!isCurrentRequest() || latest.viewerCompareEnabled) return;
-        if (!partialShaderRequested) {
-          partialShaderRequested = true;
-          void loadOcioGpuShader(partialFrame, controller.signal);
-        }
-        if (latestRef.current.frame !== frameNumber) setFrame(frameNumber);
-        setViewerUrl(null);
-        setCompareViewerUrl(null);
-        setViewerGpuFrame(partialFrame);
-        setCompareViewerGpuFrame(null);
-      };
-      const frontendStarted = performance.now();
-      if (latest.cryptoPreviewEnabled && latest.cryptoLayer) {
-        blob = await client.cryptomatteMatte(
-          latest.viewerNodeId,
-          frameNumber,
-          latest.cryptoLayer,
-          selectedMatteIds,
-          proxyWidth,
-          proxyHeight,
-          controller.signal,
+        const frontendMs = performance.now() - frontendStarted;
+        if (!isCurrentRequest()) return false;
+        const nextHistory = nextFrontendTimingHistory(frontendTimingRef.current.history, frontendMs);
+        frontendTimingRef.current = { lastMs: frontendMs, history: nextHistory };
+        setFrontendFrameMs(frontendMs);
+        const compareTiming = viewerCompareTiming(
+          latest.viewerCompareEnabled,
+          latest.viewerCompareMode,
+          latest.viewerCompareInputA,
+          latest.viewerCompareInputB,
         );
-        payloadBytes = blob.size;
-      } else {
-        if (!useDisplayPreviewForPlayback && isWebglFloatViewerSupported()) {
-          try {
-            if (latest.viewerCompareEnabled) {
-              const [frameA, frameB] = await Promise.all([
-                requestFloatFrame(latest.viewerCompareInputA),
-                requestFloatFrame(latest.viewerCompareInputB),
-              ]);
-              nextGpuFrame = frameA.frame;
-              nextGpuCompareFrame = frameB.frame;
-              payloadBytes = frameA.bytes + frameB.bytes;
-              servedFromFrontendViewerCache = frameA.frontendCacheHit && frameB.frontendCacheHit;
-              clientFrameMetrics = combineFrameMetrics(frameA.frame.metrics, frameB.frame.metrics);
-            } else {
-              const frameData = await requestFloatFrame(null, publishPartialFrame);
-              nextGpuFrame = frameData.frame;
-              payloadBytes = frameData.bytes;
-              servedFromFrontendViewerCache = frameData.frontendCacheHit;
-              clientFrameMetrics = frameData.frame.metrics ?? null;
-            }
-            if (nextGpuFrame && isCurrentRequest()) {
-              await loadOcioGpuShader(nextGpuFrame, controller.signal);
-              frontendTransport = servedFromFrontendViewerCache ? "browser-float-cache" : viewerFrameTransport(nextGpuFrame);
-            }
-          } catch (error) {
-            if (error instanceof DOMException && error.name === "AbortError") throw error;
-            if (!gpuFallbackLoggedRef.current) {
-              gpuFallbackLoggedRef.current = true;
-              addLog("error", `GPU float viewer fallback: ${error instanceof Error ? error.message : String(error)}`);
-            }
-            nextGpuFrame = null;
-            nextGpuCompareFrame = null;
-          }
-        }
-        if (!nextGpuFrame) {
-          const cpuPreview = await requestCpuPreview();
-          blob = cpuPreview.blob;
-          compareBlob = cpuPreview.compareBlob;
-          payloadBytes = blob.size + (compareBlob?.size ?? 0);
-          if (useDisplayPreviewForPlayback) {
-            frontendTransport = `display-preview-${playbackTransferMode}`;
-          }
-        }
-      }
-      const frontendMs = performance.now() - frontendStarted;
-      if (!isCurrentRequest()) return false;
-      const nextHistory = [...frontendTimingRef.current.history, frontendMs].slice(-30);
-      frontendTimingRef.current = { lastMs: frontendMs, history: nextHistory };
-      setFrontendFrameMs(frontendMs);
-      setFrontendRequestTimings((currentTimings) =>
-        [
-          ...currentTimings,
-          {
-            type: "frontend_viewer_frame",
-            node_id: latest.viewerNodeId,
-            frame: frameNumber,
-            viewer_input:
-              latest.viewerCompareEnabled && latest.viewerCompareMode === "difference"
-                ? latest.viewerCompareInputA
-                : latest.viewerCompareEnabled && latest.viewerCompareMode === "wipe"
-                  ? `${latest.viewerCompareInputA},${latest.viewerCompareInputB}`
-                  : null,
-            compare_input: latest.viewerCompareEnabled ? latest.viewerCompareInputB : null,
-            compare_mode: latest.viewerCompareEnabled ? latest.viewerCompareMode : "none",
-            channel: latest.viewerChannel,
-            transport: frontendTransport,
-            total_ms: Math.round(frontendMs * 100) / 100,
-            backend_render_ms: 0,
-            send_ms: 0,
-            bytes: payloadBytes,
-            frontend_cache_hit: servedFromFrontendViewerCache,
-            ws_wait_ms: clientFrameMetrics?.ws_wait_ms ?? 0,
-            receive_ms: clientFrameMetrics?.receive_ms ?? 0,
-            tile_copy_ms: clientFrameMetrics?.tile_copy_ms ?? 0,
-            browser_cache_hit_ms: clientFrameMetrics?.browser_cache_hit_ms ?? 0,
-            timestamp: Date.now() / 1000,
-          },
-        ].slice(-80),
-      );
-      if (!isCurrentRequest()) return false;
+        setFrontendRequestTimings((currentTimings) =>
+          appendFrontendRequestTiming(
+            currentTimings,
+            buildFrontendViewerRequestTiming({
+              nodeId: latest.viewerNodeId,
+              frame: frameNumber,
+              viewerInput: compareTiming.viewerInput,
+              compareInput: compareTiming.compareInput,
+              compareMode: compareTiming.compareMode,
+              channel: latest.viewerChannel,
+              transport: frontendTransport,
+              frontendMs,
+              payloadBytes,
+              frontendCacheHit: servedFromFrontendViewerCache,
+              metrics: clientFrameMetrics,
+            }),
+          ),
+        );
+        if (!isCurrentRequest()) return false;
 
-      const previousUrl = latestRef.current.viewerUrl;
-      if (previousUrl) URL.revokeObjectURL(previousUrl);
-      const previousCompareUrl = latestRef.current.compareViewerUrl;
-      if (previousCompareUrl) URL.revokeObjectURL(previousCompareUrl);
-      lastCompletedAutoRefreshKeyRef.current = currentRenderKey(frameNumber);
-      if (latestRef.current.frame !== frameNumber) setFrame(frameNumber);
-      if (nextGpuFrame) {
-        setViewerUrl(null);
-        setCompareViewerUrl(null);
-        setViewerGpuFrame(nextGpuFrame);
-        setCompareViewerGpuFrame(nextGpuCompareFrame);
-      } else if (blob) {
-        const url = URL.createObjectURL(blob);
-        const compareUrl = compareBlob ? URL.createObjectURL(compareBlob) : null;
-        viewerGpuMetricsRef.current = null;
-        setViewerGpuMetrics(null);
-        setViewerGpuFrame(null);
-        setCompareViewerGpuFrame(null);
-        setViewerUrl(url);
-        setCompareViewerUrl(compareUrl);
+        const previousUrl = latestRef.current.viewerUrl;
+        if (previousUrl) URL.revokeObjectURL(previousUrl);
+        const previousCompareUrl = latestRef.current.compareViewerUrl;
+        if (previousCompareUrl) URL.revokeObjectURL(previousCompareUrl);
+        clearViewerError();
+        lastCompletedAutoRefreshKeyRef.current = currentRenderKey(frameNumber);
+        if (latestRef.current.frame !== frameNumber) setFrame(frameNumber);
+        const resultKind = viewerResultKind(nextGpuFrame, blob);
+        if (resultKind === "gpu") {
+          setViewerUrl(null);
+          setCompareViewerUrl(null);
+          setViewerGpuFrame(nextGpuFrame);
+          setCompareViewerGpuFrame(nextGpuCompareFrame);
+        } else if (resultKind === "blob" && blob) {
+          const url = URL.createObjectURL(blob);
+          const compareUrl = compareBlob ? URL.createObjectURL(compareBlob) : null;
+          viewerGpuMetricsRef.current = null;
+          setViewerGpuMetrics(null);
+          setViewerGpuFrame(null);
+          setCompareViewerGpuFrame(null);
+          setViewerUrl(url);
+          setCompareViewerUrl(compareUrl);
+        }
+        if (shouldReuseFrontendCache(servedFromFrontendViewerCache, nextGpuFrame)) {
+          setCachedFrames(viewerReadyCachedFrames(frontendViewerCacheRef.current, latestRef.current, renderRevisionRef.current));
+          refreshCacheStatusLabel();
+        } else {
+          await loadCacheStatus();
+        }
+        if (isCurrentRequest()) {
+          startInteractiveWarm(frameNumber, latestRef.current, controller.signal);
+        }
+        return true;
+      } catch (error) {
+        if (error instanceof DOMException && error.name === "AbortError") {
+          throw error;
+        }
+        reportViewerError(error);
+        try {
+          await loadCacheStatus();
+        } catch {
+          // Keep the original viewer error visible.
+        }
+        throw error;
       }
-      if (servedFromFrontendViewerCache && nextGpuFrame) {
-        setCachedFrames(viewerReadyCachedFrames(frontendViewerCacheRef.current, latestRef.current, renderRevisionRef.current));
-        refreshCacheStatusLabel();
-      } else {
-        await loadCacheStatus();
-      }
-      return true;
     },
-    [addLog, currentRenderKey, loadCacheStatus, loadOcioGpuShader, refreshCacheStatusLabel, setFrame, setViewerUrl, syncGraphAndSettings],
+    [
+      addLog,
+      clearViewerError,
+      currentRenderKey,
+      isApiError,
+      loadCacheStatus,
+      loadOcioGpuShader,
+      refreshCacheStatusLabel,
+      reportViewerError,
+      setFrame,
+      setViewerUrl,
+      startInteractiveWarm,
+      syncGraphAndSettings,
+    ],
   );
 
   const cancelIdlePrefetch = useCallback(() => {
@@ -961,8 +1300,13 @@ export default function App() {
   );
 
   useEffect(() => {
-    if (!showViewerPanel || !project || !graph || isPlaying || isRendering || cryptoPreviewEnabled) return;
-    const viewerHasCompleteFrame = Boolean(viewerUrl || (viewerGpuFrame && !viewerGpuFrame.header.partial));
+    clearViewerError();
+    setNodeErrors({});
+  }, [clearViewerError, renderRevision]);
+
+  useEffect(() => {
+    if (!showViewerPanel || !project || !graph || isPlaying || isRendering || cryptoPreviewEnabled || viewerError) return;
+    const viewerHasCompleteFrame = Boolean(viewerUrl || viewerFrameIsFinal(viewerGpuFrame));
     if (viewerHasCompleteFrame) {
       firstVisibleFrameRequestRef.current = { key: "", attempts: 0 };
       return;
@@ -974,7 +1318,7 @@ export default function App() {
     if (attempts >= 4) return;
 
     const handle = window.setTimeout(() => {
-      const currentViewerComplete = Boolean(latestRef.current.viewerUrl || (viewerGpuFrame && !viewerGpuFrame.header.partial));
+      const currentViewerComplete = Boolean(latestRef.current.viewerUrl || viewerFrameIsFinal(viewerGpuFrame));
       if (currentViewerComplete || latestRef.current.isPlaying) return;
       firstVisibleFrameRequestRef.current = { key, attempts: attempts + 1 };
       void refreshViewer(true);
@@ -989,6 +1333,8 @@ export default function App() {
     project,
     refreshViewer,
     showViewerPanel,
+    viewerError,
+    viewerRoi,
     viewerGpuFrame,
     viewerUrl,
   ]);
@@ -997,7 +1343,7 @@ export default function App() {
     (nextFrame: number) => {
       const current = latestRef.current;
       const settings = current.project?.settings;
-      const normalized = settings ? clampFrame(nextFrame, settings.frame_start, settings.frame_end) : nextFrame;
+      const normalized = clampProjectFrame(settings, nextFrame);
       cancelIdlePrefetch();
       abortRef.current?.abort();
       const controller = new AbortController();
@@ -1020,7 +1366,14 @@ export default function App() {
 
   const runIdlePrefetch = useCallback(
     async (sessionId: number, anchorFrame: number, snapshot: typeof latestRef.current) => {
-      if (!snapshot.graph || !snapshot.project || snapshot.cryptoPreviewEnabled || !isWebglFloatViewerSupported()) return;
+      if (
+        !snapshot.graph ||
+        !snapshot.project ||
+        snapshot.cryptoPreviewEnabled ||
+        !isWebglFloatViewerSupported() ||
+        viewerErrorRef.current
+      )
+        return;
       const settings = snapshot.project.settings;
       if (
         !settings.proxy_enabled &&
@@ -1037,7 +1390,7 @@ export default function App() {
       setPlaybackStatus(`warming viewer cache`);
       try {
         for (const frameToWarm of frames) {
-          if (controller.signal.aborted || idlePrefetchSessionRef.current !== sessionId) break;
+          if (controller.signal.aborted || idlePrefetchSessionRef.current !== sessionId || viewerErrorRef.current) break;
           setPlaybackStatus(`warming F${frameToWarm}`);
           if (snapshot.viewerCompareEnabled) {
             await Promise.all([
@@ -1069,8 +1422,8 @@ export default function App() {
 
   useEffect(() => {
     cancelIdlePrefetch();
-    if (!project || isPlaying || isRendering || cryptoPreviewEnabled || !project.settings.auto_refresh) return;
-    const activeViewerFrameReady = Boolean(viewerUrl || (viewerGpuFrame && !viewerGpuFrame.header.partial));
+    if (!project || isPlaying || isRendering || cryptoPreviewEnabled || !settings?.auto_refresh || viewerError) return;
+    const activeViewerFrameReady = Boolean(viewerUrl || viewerFrameIsFinal(viewerGpuFrame));
     if (!activeViewerFrameReady) return;
     const sessionId = idlePrefetchSessionRef.current + 1;
     idlePrefetchSessionRef.current = sessionId;
@@ -1090,28 +1443,30 @@ export default function App() {
     frame,
     isPlaying,
     isRendering,
-    project?.settings.auto_refresh,
-    project?.settings.frame_start,
-    project?.settings.frame_end,
-    project?.settings.proxy_enabled,
-    project?.settings.viewer_max_width,
-    project?.settings.viewer_max_height,
+    settings?.auto_refresh,
+    settings?.frame_start,
+    settings?.frame_end,
+    settings?.proxy_enabled,
+    settings?.viewer_max_width,
+    settings?.viewer_max_height,
     renderRevision,
     runIdlePrefetch,
     viewerChannel,
     viewerCompareEnabled,
     viewerCompareInputA,
     viewerCompareInputB,
+    viewerRoi,
+    viewerError,
     viewerGpuFrame,
     viewerUrl,
   ]);
 
   useEffect(() => {
-    if (!project || isPlaying || cryptoPreviewEnabled || !project.settings.cache_enabled) return;
-    if (!project.preferences.read_preload_enabled) return;
+    if (!project || isPlaying || cryptoPreviewEnabled || !settings?.cache_enabled || viewerError) return;
+    if (!preferences?.read_preload_enabled) return;
     const snapshot = { ...latestRef.current };
-    const maxFrames = Math.max(1, Math.round(project.preferences.read_preload_max_frames ?? 6));
-    const frames = readPreloadFrameOrder(frame, project.settings.frame_start, project.settings.frame_end, maxFrames);
+    const maxFrames = Math.max(1, Math.round(preferences?.read_preload_max_frames ?? 6));
+    const frames = readPreloadFrameOrder(frame, settings?.frame_start ?? 1001, settings?.frame_end ?? 1010, maxFrames);
     const handle = window.setTimeout(() => scheduleReadPreload(frames, snapshot), 250);
     return () => window.clearTimeout(handle);
   }, [
@@ -1119,47 +1474,49 @@ export default function App() {
     frame,
     isPlaying,
     project,
-    project?.preferences.read_preload_enabled,
-    project?.preferences.read_preload_max_frames,
-    project?.settings.cache_enabled,
-    project?.settings.frame_start,
-    project?.settings.frame_end,
+    preferences?.read_preload_enabled,
+    preferences?.read_preload_max_frames,
+    settings?.cache_enabled,
+    settings?.frame_start,
+    settings?.frame_end,
     renderRevision,
     scheduleReadPreload,
+    viewerError,
     viewerChannel,
     viewerCompareEnabled,
     viewerCompareInputA,
     viewerCompareInputB,
+    viewerRoi,
   ]);
 
   useEffect(() => {
     if (isPlaying) return;
     if (isRendering) return;
-    if (!project?.settings.auto_refresh || !latestRef.current.graph) return;
+    if (!settings?.auto_refresh || !latestRef.current.graph || viewerError) return;
     if (skipNextAutoRefreshRef.current) {
       skipNextAutoRefreshRef.current = false;
       return;
     }
     const scheduledKey = currentRenderKey();
-    const viewerHasCompleteFrame = Boolean(viewerUrl || (viewerGpuFrame && !viewerGpuFrame.header.partial));
+    const viewerHasCompleteFrame = Boolean(viewerUrl || viewerFrameIsFinal(viewerGpuFrame));
     if (lastCompletedAutoRefreshKeyRef.current === scheduledKey && viewerHasCompleteFrame) return;
     const handle = window.setTimeout(() => {
-      const stillHasCompleteFrame = Boolean(latestRef.current.viewerUrl || (viewerGpuFrame && !viewerGpuFrame.header.partial));
+      const stillHasCompleteFrame = Boolean(latestRef.current.viewerUrl || viewerFrameIsFinal(viewerGpuFrame));
       if (lastCompletedAutoRefreshKeyRef.current === scheduledKey && stillHasCompleteFrame) return;
       void refreshViewer(true);
     }, 120);
     return () => window.clearTimeout(handle);
   }, [
     frame,
-    project?.settings.auto_refresh,
-    project?.settings.viewer_display,
-    project?.settings.viewer_view,
-    project?.settings.proxy_enabled,
-    project?.settings.viewer_max_width,
-    project?.settings.viewer_max_height,
-    project?.settings.tile_rendering_enabled,
-    project?.settings.tile_height,
-    project?.settings.tile_workers,
+    settings?.auto_refresh,
+    settings?.viewer_display,
+    settings?.viewer_view,
+    settings?.proxy_enabled,
+    settings?.viewer_max_width,
+    settings?.viewer_max_height,
+    settings?.tile_rendering_enabled,
+    settings?.tile_height,
+    settings?.tile_workers,
     viewerChannel,
     viewerCompareEnabled,
     viewerCompareInputA,
@@ -1168,6 +1525,7 @@ export default function App() {
     viewerFstop,
     viewerGain,
     viewerSaturation,
+    viewerRoi,
     viewerGpuFrame,
     viewerUrl,
     cryptoLayer,
@@ -1178,13 +1536,14 @@ export default function App() {
     isRendering,
     refreshViewer,
     renderRevision,
+    viewerError,
   ]);
 
   useEffect(() => {
-    if (!isPlaying || !project) return;
-    const frameStart = project.settings.frame_start;
-    const frameEnd = project.settings.frame_end;
-    const delay = Math.max(1000 / Math.max(project.settings.fps, 1), 1);
+    if (!isPlaying || !project || viewerError) return;
+    const frameStart = projectFrameStart(settings);
+    const frameEnd = projectFrameEnd(settings);
+    const delay = Math.max(1000 / Math.max(settings?.fps ?? 24, 1), 1);
     const controller = new AbortController();
     let cancelled = false;
     cancelIdlePrefetch();
@@ -1196,21 +1555,23 @@ export default function App() {
 
     const nextFrame = (current: number) => (current >= frameEnd ? frameStart : current + 1);
     const warmAhead = (frameToRender: number) => {
+      if (viewerErrorRef.current) return;
       const latest = latestRef.current;
       if (!latest.project || !latest.graph) return;
+      const playbackSettings = latest.project.settings;
       const frames = playbackAheadFrameOrder(
         frameToRender,
         frameStart,
         frameEnd,
-        Math.max(2, Math.min((latest.project.settings.render_workers ?? 4) * 2, 12)),
+        playbackWarmFrameCount(playbackSettings),
       ).filter((frameToWarm) => frameToWarm !== frameToRender);
       if (frames.length === 0) return;
       scheduleReadPreload([frameToRender, ...frames], latest);
-      const display = latest.project.settings.viewer_display;
-      const view = latest.project.settings.viewer_view;
+      const { display, view } = viewerDisplaySelection(playbackSettings);
       const channel = latest.viewerChannel;
-      const inputs = latest.viewerCompareEnabled ? [latest.viewerCompareInputA, latest.viewerCompareInputB] : [null];
+      const inputs = viewerCompareInputs(latest.viewerCompareEnabled, latest.viewerCompareInputA, latest.viewerCompareInputB);
       for (const viewerInput of inputs) {
+        if (viewerErrorRef.current) return;
         void client
           .warmViewerFrames(latest.viewerNodeId, frames, { viewerInput, display, view, channel })
           .catch((error) => {
@@ -1220,13 +1581,13 @@ export default function App() {
           });
       }
 
-      const frontendFrameLimit = latest.project.settings.proxy_enabled
-        ? Math.max(2, Math.min(latest.project.settings.viewer_tile_lanes ?? 3, 6))
-        : 1;
+      const frontendFrameLimit = playbackFrontendWarmFrameLimit(playbackSettings);
       for (const viewerInput of inputs) {
         for (const frameToWarm of frames.slice(0, frontendFrameLimit)) {
+          if (controller.signal.aborted || viewerErrorRef.current) return;
           void requestCachedFloatFrame(frameToWarm, viewerInput, controller.signal, latest)
             .then(() => {
+              if (controller.signal.aborted || viewerErrorRef.current) return;
               setCachedFrames(viewerReadyCachedFrames(frontendViewerCacheRef.current, latestRef.current, renderRevisionRef.current));
               refreshCacheStatusLabel();
             })
@@ -1289,6 +1650,7 @@ export default function App() {
     scheduleReadPreload,
     setPlaying,
     setRendering,
+    viewerError,
   ]);
 
   useEffect(() => {
@@ -1349,7 +1711,7 @@ export default function App() {
         setInspectorTab("root");
         return;
       }
-      const hotkeys = project?.preferences.hotkeys;
+      const hotkeys = projectHotkeys(project);
       if (matchesHotkey(event, hotkeys?.toggle_disable ?? "d")) {
         event.preventDefault();
         if (!selectedNode) {
@@ -1404,13 +1766,13 @@ export default function App() {
   async function saveProject(pathOverride?: string | null) {
     const current = latestRef.current;
     if (!current.project || !current.graph) return;
-    if (pathOverride === undefined && !current.project.settings.project_path) {
+    if (pathOverride === undefined && !projectPath(current.project)) {
       await saveProjectToBrowserFile(undefined, true);
       return;
     }
     const targetPath =
       pathOverride === undefined
-        ? current.project.settings.project_path
+        ? projectPath(current.project)
         : pathOverride;
     if (!targetPath) {
       addLog("info", "Save cancelled.");
@@ -1424,7 +1786,7 @@ export default function App() {
       await syncGraphAndSettings();
       const refreshed = latestRef.current;
       if (!refreshed.project || !refreshed.graph) return;
-      const projectToSave = projectWithCurrentGraph(refreshed.project, refreshed.graph);
+      const projectToSave = projectWithCurrentGraph(refreshed.project, refreshed.graph, DEFAULT_PYTHON_SCRIPT);
       const saved = await client.saveProject(targetPath, projectToSave);
       setProject(saved);
       addLog("info", `Project saved to ${saved.settings.project_path ?? targetPath}.`);
@@ -1436,7 +1798,7 @@ export default function App() {
   async function saveProjectAs() {
     const current = latestRef.current;
     if (!current.project) return;
-    const suggested = current.project.settings.project_path ?? `${current.project.project_name || "opencomp_project"}.opencomp`;
+    const suggested = suggestedProjectPath(current.project);
     const path = window.prompt("Full backend path, or filename for browser download", suggested);
     if (!path) {
       addLog("info", "Save As cancelled.");
@@ -1449,7 +1811,7 @@ export default function App() {
     const current = latestRef.current;
     if (!current.project || !current.graph) return;
     const fileName = ensureOpenCompExtension(filename || suggestedProjectFilename(current.project));
-    const projectToSave = projectWithCurrentGraph(current.project, current.graph, true);
+    const projectToSave = projectWithCurrentGraph(current.project, current.graph, DEFAULT_PYTHON_SCRIPT, true);
     const blob = new Blob([JSON.stringify(projectToSave, null, 2)], { type: "application/json" });
     const saved = await saveBlobWithBrowser(blob, fileName, "OpenComp project", "application/json", [".opencomp"], preferPicker);
     if (saved.kind === "cancelled") {
@@ -1480,7 +1842,7 @@ export default function App() {
   }
 
   async function loadProjectFromPath() {
-    const path = window.prompt("Open OpenComp script from backend path", project?.settings.project_path ?? "");
+    const path = window.prompt("Open OpenComp script from backend path", projectPath(project) ?? "");
     if (!path) {
       addLog("info", "Open cancelled.");
       return;
@@ -1496,19 +1858,16 @@ export default function App() {
   async function adoptLoadedProject(loaded: Project, message: string) {
     cancelIdlePrefetch();
     const config = await loadColorConfig();
-    const settings = {
-      ...loaded.settings,
-      viewer_display: loaded.settings.viewer_display ?? config.default_display,
-      viewer_view: loaded.settings.viewer_view ?? config.default_view,
-    };
-    if (JSON.stringify(settings) !== JSON.stringify(loaded.settings)) {
-      await client.putProjectSettings(settings);
+    const hydratedProject = projectWithViewerDefaults(loaded, config);
+    if (JSON.stringify(hydratedProject.settings) !== JSON.stringify(loaded.settings)) {
+      await client.putProjectSettings(hydratedProject.settings);
     }
     resetFrontendViewerCache();
     setCachedFrames([]);
     setSelectedMetadata(null);
     setViewerMetadata(null);
-    setProject({ ...loaded, settings });
+    primeScriptEditorState(hydratedProject);
+    setProject(hydratedProject);
     await loadCacheStatus();
     addLog("info", message);
   }
@@ -1520,8 +1879,8 @@ export default function App() {
       await syncGraphAndSettings();
       const refreshed = latestRef.current;
       if (!refreshed.project || !refreshed.graph) return;
-      const projectToExport = projectWithCurrentGraph(refreshed.project, refreshed.graph);
-      const suggested = suggestedNukeFilename(projectToExport);
+      const projectToExport = projectWithCurrentGraph(refreshed.project, refreshed.graph, DEFAULT_PYTHON_SCRIPT);
+      const suggested = suggestedNukePath(projectToExport);
       const path = window.prompt("Full backend path, or filename for browser .nk export", suggested);
       if (!path) {
         addLog("info", "Nuke export cancelled.");
@@ -1564,14 +1923,11 @@ export default function App() {
       cancelIdlePrefetch();
       const newProject = await client.newProject();
       const config = await loadColorConfig();
-      const settings = {
-        ...newProject.settings,
-        viewer_display: newProject.settings.viewer_display ?? config.default_display,
-        viewer_view: newProject.settings.viewer_view ?? config.default_view,
-      };
-      await client.putProjectSettings(settings);
+      const hydratedProject = projectWithViewerDefaults(newProject, config);
+      await client.putProjectSettings(hydratedProject.settings);
       resetFrontendViewerCache();
-      setProject({ ...newProject, settings });
+      primeScriptEditorState(hydratedProject);
+      setProject(hydratedProject);
       await loadCacheStatus();
       addLog("info", "New reference sequence project loaded.");
     } catch (error) {
@@ -1584,8 +1940,9 @@ export default function App() {
       cancelIdlePrefetch();
       const created = await client.createScript(`Comp ${(project?.script_tabs.length ?? 0) + 1}`);
       resetFrontendViewerCache();
+      primeScriptEditorState(created);
       setProject(created);
-      addLog("info", `Created script tab ${created.script_tabs.find((tab) => tab.id === created.active_script_id)?.name}.`);
+      addLog("info", `Created script tab ${activeScriptName(created) ?? created.active_script_id}.`);
     } catch (error) {
       addLog("error", error instanceof Error ? error.message : String(error));
     }
@@ -1597,9 +1954,10 @@ export default function App() {
       await syncGraphAndSettings();
       const activated = await client.setActiveScript(scriptId);
       resetFrontendViewerCache();
+      primeScriptEditorState(activated);
       setProject(activated);
       await loadCacheStatus();
-      addLog("info", `Activated ${activated.script_tabs.find((tab) => tab.id === scriptId)?.name}.`);
+      addLog("info", `Activated ${activeScriptName(activated) ?? scriptId}.`);
     } catch (error) {
       addLog("error", error instanceof Error ? error.message : String(error));
     }
@@ -1621,12 +1979,19 @@ export default function App() {
     setScriptOutput("Running...");
     try {
       await syncGraphAndSettings();
+      const currentScriptId = activeScriptId(project) ?? "main";
+      setScriptEditorDrafts((current) => ({ ...current, [currentScriptId]: scriptEditorCode }));
       const result = await client.runPython(scriptEditorCode);
-      const nextFrame = clampFrame(frame, result.project.settings.frame_start, result.project.settings.frame_end);
+      const nextFrame = clampProjectFrame(result.project.settings, frame);
       if (result.changed) {
         resetFrontendViewerCache();
       }
+      const syncedGraph = result.changed ? await client.getGraph() : graph;
+      primeScriptEditorState(result.project);
       setProject(result.project);
+      if (syncedGraph) {
+        setGraph(syncedGraph);
+      }
       setFrame(nextFrame);
       await loadCacheStatus();
       setScriptOutput(formatPythonScriptResult(result));
@@ -1694,8 +2059,6 @@ export default function App() {
     setCryptoPreviewEnabled(false);
   }
 
-  const settings = project?.settings ?? null;
-
   return (
     <main className="app-shell">
       <header className="topbar">
@@ -1757,195 +2120,23 @@ export default function App() {
         {(project?.script_tabs ?? []).map((tab) => (
           <button
             key={tab.id}
-            className={tab.id === project?.active_script_id ? "active" : ""}
+            className={tab.id === activeScriptId(project) ? "active" : ""}
             onClick={() => void activateScriptTab(tab.id)}
           >
             {tab.name}
           </button>
         ))}
         <button onClick={() => void createScriptTab()}>+ Script</button>
-        <span>{activeScriptName ? `active: ${activeScriptName}` : "no active script"}</span>
+        <span>{currentActiveScriptName ? `active: ${currentActiveScriptName}` : "no active script"}</span>
       </section>
 
       {showPreferences && project && (
-        <div
-          className="preferences-backdrop"
-          role="presentation"
-          onPointerDown={(event) => {
-            if (event.target === event.currentTarget) setShowPreferences(false);
-          }}
-        >
-          <section className="preferences-dialog" role="dialog" aria-modal="true" aria-label="Preferences">
-            <div className="prefs-header">
-              <strong>Preferences</strong>
-              <div className="panel-actions">
-                <button onClick={() => void savePreferences()}>Save Preferences</button>
-                <button onClick={() => setShowPreferences(false)} title="Close preferences">
-                  <X size={14} />
-                </button>
-              </div>
-            </div>
-            <div className="prefs-grid">
-              <label>
-                Autosave
-                <input
-                  type="number"
-                  value={project.preferences.autosave_seconds}
-                  onChange={(event) => updatePreferences({ autosave_seconds: Number(event.target.value) })}
-                />
-              </label>
-              <label>
-                Idle Autosave
-                <input
-                  type="number"
-                  value={project.preferences.idle_autosave_seconds}
-                  onChange={(event) => updatePreferences({ idle_autosave_seconds: Number(event.target.value) })}
-                />
-              </label>
-              <label>
-                Cache MB
-                <input
-                  type="number"
-                  value={project.preferences.cache_memory_limit_mb}
-                  onChange={(event) => updatePreferences({ cache_memory_limit_mb: Number(event.target.value) })}
-                />
-              </label>
-              <label className="toggle-label">
-                <input
-                  type="checkbox"
-                  checked={project.preferences.read_preload_enabled ?? true}
-                  onChange={(event) => updatePreferences({ read_preload_enabled: event.target.checked })}
-                />
-                Preload Reads
-              </label>
-              <label>
-                Read Preload Frames
-                <input
-                  type="number"
-                  min={1}
-                  value={project.preferences.read_preload_max_frames ?? 6}
-                  onChange={(event) => updatePreferences({ read_preload_max_frames: Number(event.target.value) })}
-                />
-              </label>
-              <label>
-                Playback Transfer
-                <select
-                  value={project.preferences.playback_transfer_mode}
-                  onChange={(event) =>
-                    updatePreferences({
-                      playback_transfer_mode: event.target.value as Project["preferences"]["playback_transfer_mode"],
-                    })
-                  }
-                >
-                  <option value="hybrid-preview">GPU Float + Cache</option>
-                  <option value="always-float">Always Float</option>
-                  <option value="fast-display">Fast Display PNG</option>
-                </select>
-              </label>
-              <label>
-                Viewer Precision
-                <select
-                  value={project.preferences.viewer_transfer_precision ?? "float16"}
-                  onChange={(event) =>
-                    updatePreferences({
-                      viewer_transfer_precision: event.target.value as Project["preferences"]["viewer_transfer_precision"],
-                    })
-                  }
-                >
-                  <option value="float32">Float 32</option>
-                  <option value="float16">Half Float 16</option>
-                  <option value="rgb10a2">10-bit Preview</option>
-                  <option value="uint8">8-bit Preview</option>
-                </select>
-              </label>
-              <label>
-                Zoom Speed
-                <input
-                  type="number"
-                  step="0.05"
-                  value={project.preferences.viewer_zoom_speed}
-                  onChange={(event) => updatePreferences({ viewer_zoom_speed: Number(event.target.value) })}
-                />
-              </label>
-              <label className="toggle-label">
-                <input
-                  type="checkbox"
-                  checked={project.preferences.wheel_zoom_enabled}
-                  onChange={(event) => updatePreferences({ wheel_zoom_enabled: event.target.checked })}
-                />
-                Wheel Zoom
-              </label>
-              <label className="toggle-label">
-                <input
-                  type="checkbox"
-                  checked={project.preferences.auto_connect_new_nodes}
-                  onChange={(event) => updatePreferences({ auto_connect_new_nodes: event.target.checked })}
-                />
-                Auto Connect
-              </label>
-              <label>
-                Read Hotkey
-                <input
-                  value={project.preferences.hotkeys.add_read}
-                  onChange={(event) =>
-                    updatePreferences({ hotkeys: { ...project.preferences.hotkeys, add_read: event.target.value } })
-                  }
-                />
-              </label>
-              <label>
-                Write Hotkey
-                <input
-                  value={project.preferences.hotkeys.add_write}
-                  onChange={(event) =>
-                    updatePreferences({ hotkeys: { ...project.preferences.hotkeys, add_write: event.target.value } })
-                  }
-                />
-              </label>
-              <label>
-                Merge Hotkey
-                <input
-                  value={project.preferences.hotkeys.add_merge}
-                  onChange={(event) =>
-                    updatePreferences({ hotkeys: { ...project.preferences.hotkeys, add_merge: event.target.value } })
-                  }
-                />
-              </label>
-              <label>
-                Group Hotkey
-                <input
-                  value={project.preferences.hotkeys.add_group}
-                  onChange={(event) =>
-                    updatePreferences({ hotkeys: { ...project.preferences.hotkeys, add_group: event.target.value } })
-                  }
-                />
-              </label>
-              <label>
-                Disable Hotkey
-                <input
-                  value={project.preferences.hotkeys.toggle_disable ?? "d"}
-                  onChange={(event) =>
-                    updatePreferences({ hotkeys: { ...project.preferences.hotkeys, toggle_disable: event.target.value } })
-                  }
-                />
-              </label>
-              <label>
-                Init Scripts
-                <input
-                  value={project.preferences.custom_init_scripts.join(";")}
-                  onChange={(event) =>
-                    updatePreferences({
-                      custom_init_scripts: event.target.value
-                        .split(";")
-                        .map((item) => item.trim())
-                        .filter(Boolean),
-                    })
-                  }
-                  placeholder="script_a.py;script_b.py"
-                />
-              </label>
-            </div>
-          </section>
-        </div>
+        <PreferencesDialog
+          project={project}
+          onChange={updatePreferences}
+          onClose={() => setShowPreferences(false)}
+          onSave={() => void savePreferences()}
+        />
       )}
 
       <ScriptEditor
@@ -1953,7 +2144,11 @@ export default function App() {
         code={scriptEditorCode}
         output={scriptOutput}
         isRunning={isRunningScript}
-        onCodeChange={setScriptEditorCode}
+        onCodeChange={(code) => {
+          setScriptEditorCode(code);
+          const currentScriptId = activeScriptId(project) ?? "main";
+          setScriptEditorDrafts((current) => ({ ...current, [currentScriptId]: code }));
+        }}
         onRun={() => void runPythonScript()}
         onClose={() => setShowScriptEditor(false)}
       />
@@ -2054,7 +2249,7 @@ export default function App() {
               ocioGpuShader={ocioGpuShader}
               frame={frame}
               settings={settings}
-              preferences={project?.preferences ?? null}
+              preferences={preferences}
               colorConfig={colorConfig}
               metadata={viewerMetadata}
               selectedChannel={viewerChannel}
@@ -2069,6 +2264,7 @@ export default function App() {
               wipePosition={wipePosition}
               wipeAngle={wipeAngle}
               viewerTool={viewerTool}
+              viewerRoi={viewerRoi}
               cryptomatteLayers={cryptomatteLayers}
               cryptoLayer={cryptoLayer}
               cryptoSelection={cryptoSelection}
@@ -2078,9 +2274,12 @@ export default function App() {
               isPlaying={isPlaying}
               isRendering={isRendering}
               renderStatus={playbackStatus}
+              renderError={viewerError?.message ?? null}
+              viewerProfilePreset={viewerProfilePreset}
               onTogglePlayback={() => setPlaying(!isPlaying)}
               onFrameChange={handleFrameChange}
               onRefresh={() => void refreshViewer()}
+              onApplyViewerProfile={applyViewerProfilePreset}
               onDisplayChange={(display) => updateProjectSettings({ viewer_display: display, viewer_view: null }, false)}
               onViewChange={(view) => updateProjectSettings({ viewer_view: view }, false)}
               onProxyEnabledChange={(enabled) => updateProjectSettings({ proxy_enabled: enabled })}
@@ -2103,6 +2302,7 @@ export default function App() {
               onWipePositionChange={setWipePosition}
               onWipeAngleChange={setWipeAngle}
               onViewerToolChange={setViewerTool}
+              onViewerRoiChange={setViewerRoi}
               onCryptoLayerChange={changeCryptoLayer}
               onCryptoPreviewChange={setCryptoPreviewEnabled}
               onCryptoClear={() => {
@@ -2146,8 +2346,15 @@ export default function App() {
                     }
                   }}
                   onPointerWorldPosition={setLastGraphPosition}
-                  activeNodeIds={activeRuntimeNodeIds}
+                  foregroundActiveNodeIds={foregroundRuntimeNodeIds}
+                  backgroundActiveNodeIds={backgroundRuntimeNodeIds}
                   nodeTimings={nodeTimings}
+                  nodeErrors={nodeErrors}
+                  activeViewerNodeId={viewerNodeId}
+                  frontendViewerTiming={latestFrontendViewerTiming}
+                  executionBackend={projectExecutionBackend(project)}
+                  gpuRuntimeAvailable={gpuRuntimeAvailable}
+                  gpuSupportedNodeTypes={gpuSupportedNodeTypes}
                 />
               </div>
             </section>
@@ -2171,9 +2378,11 @@ export default function App() {
           frontendRequestTimings={frontendRequestTimings}
           viewerGpuMetrics={viewerGpuMetrics}
           activeTab={inspectorTab}
+          viewerProfilePreset={viewerProfilePreset}
           onTabChange={setInspectorTab}
           onChange={updateNode}
           onSettingsChange={updateProjectSettings}
+          onApplyViewerProfile={applyViewerProfilePreset}
           onRenderWrite={() => void renderSelectedWrite()}
         />
       </section>
@@ -2193,18 +2402,20 @@ function viewerFloatCacheKey(
   frame: number,
   channel: string,
   viewerInput: string | null,
+  viewerRoi: { x: number; y: number; width: number; height: number } | null,
 ) {
   const settings = project.settings;
   return JSON.stringify({
     kind: "float-viewer",
-    transportPrecision: project.preferences.viewer_transfer_precision ?? "float16",
+    transportPrecision: viewerTransferPrecision(project),
     transportTiles: true,
     renderRevision,
-    scriptId: project.active_script_id,
+    scriptId: activeScriptId(project) ?? "main",
     viewerNodeId,
     frame,
     input: String(viewerInput ?? activeViewerInput(graph, viewerNodeId) ?? ""),
     channel,
+    roi: viewerRoi ? `${viewerRoi.x}:${viewerRoi.y}:${viewerRoi.width}:${viewerRoi.height}` : "",
     proxy: proxyCacheToken(project),
     ocioConfig: settings.ocio_config ?? "",
     workingColorspace: settings.working_colorspace,
@@ -2221,60 +2432,24 @@ function transferModeForPrecision(
 }
 
 function frontendCacheFrameContext(
-  snapshot: { graph: ProjectGraph | null; project: Project | null; viewerNodeId: string; viewerChannel: string },
+  snapshot: {
+    graph: ProjectGraph | null;
+    project: Project | null;
+    viewerNodeId: string;
+    viewerChannel: string;
+    viewerRoi?: { x: number; y: number; width: number; height: number } | null;
+  },
   renderRevision: number,
 ) {
   if (!snapshot.project) return null;
   return {
     renderRevision,
-    scriptId: snapshot.project.active_script_id,
+    scriptId: activeScriptId(snapshot.project) ?? "main",
     viewerNodeId: snapshot.viewerNodeId,
     channel: snapshot.viewerChannel,
+    roi: snapshot.viewerRoi ? `${snapshot.viewerRoi.x}:${snapshot.viewerRoi.y}:${snapshot.viewerRoi.width}:${snapshot.viewerRoi.height}` : "",
     proxy: proxyCacheToken(snapshot.project),
   };
-}
-
-function projectWithCurrentGraph(project: Project, graph: ProjectGraph, clearProjectPath = false): Project {
-  const activeScriptId = project.active_script_id || project.script_tabs[0]?.id || "main";
-  const scriptTabs =
-    project.script_tabs.length > 0
-      ? project.script_tabs.map((tab) => (tab.id === activeScriptId ? { ...tab, graph } : tab))
-      : [{ id: activeScriptId, name: "Comp 1", graph, path: null, startup_scripts: [], kind: "comp" }];
-  return {
-    ...project,
-    active_script_id: activeScriptId,
-    graph,
-    script_tabs: scriptTabs,
-    settings: {
-      ...project.settings,
-      project_path: clearProjectPath ? null : project.settings.project_path,
-    },
-  };
-}
-
-function isBackendFilesystemPath(path: string) {
-  const value = path.trim();
-  return /^[A-Za-z]:[\\/]/.test(value) || value.startsWith("\\\\") || value.startsWith("/") || value.includes("/") || value.includes("\\");
-}
-
-function suggestedProjectFilename(project: Project) {
-  return ensureOpenCompExtension((project.project_name || "opencomp_project").replace(/[^A-Za-z0-9_.-]+/g, "_"));
-}
-
-function ensureOpenCompExtension(filename: string) {
-  const trimmed = filename.trim() || "opencomp_project.opencomp";
-  return trimmed.toLowerCase().endsWith(".opencomp") ? trimmed : `${trimmed}.opencomp`;
-}
-
-function suggestedNukeFilename(project: Project) {
-  const fromPath = project.settings.project_path?.replace(/\.opencomp$/i, ".nk");
-  if (fromPath) return fromPath;
-  return ensureNukeExtension((project.project_name || "opencomp_project").replace(/[^A-Za-z0-9_.-]+/g, "_"));
-}
-
-function ensureNukeExtension(filename: string) {
-  const trimmed = filename.trim() || "opencomp_project.nk";
-  return trimmed.toLowerCase().endsWith(".nk") ? trimmed : `${trimmed}.nk`;
 }
 
 async function saveBlobWithBrowser(
@@ -2315,15 +2490,6 @@ function downloadBlob(blob: Blob, filename: string) {
   link.click();
   link.remove();
   window.setTimeout(() => URL.revokeObjectURL(url), 1000);
-}
-
-function proxyCacheToken(project: Project) {
-  const settings = project.settings;
-  return settings.proxy_enabled ? `${settings.viewer_max_width}x${settings.viewer_max_height}` : "full";
-}
-
-function viewerFrameTransport(frame: FloatViewerFrame) {
-  return `webgl-${frame.header.dtype}${frame.header.tile_stream ? "-tiles" : ""}`;
 }
 
 function combineFrameMetrics(
@@ -2370,7 +2536,7 @@ function storeFrontendViewerFrame(
     cache.bytes -= existing.bytes;
     cache.entries.delete(key);
   }
-  const bytes = frame.header.byte_length || frame.pixels.byteLength;
+  const bytes = viewerFrameByteLength(frame);
   cache.entries.set(key, { frame, bytes });
   cache.bytes += bytes;
 
@@ -2393,7 +2559,7 @@ function clearFrontendViewerCache(cache: FrontendViewerCacheState) {
 }
 
 function frontendViewerCacheLimitBytes(project: Project | null) {
-  const preferenceMb = project?.preferences.cache_memory_limit_mb ?? 1024;
+  const preferenceMb = projectCacheLimitMb(project);
   const targetBytes = Math.max(FRONTEND_VIEWER_CACHE_DEFAULT_BYTES, Math.round(preferenceMb) * 1024 * 1024);
   return Math.max(FRONTEND_VIEWER_CACHE_MIN_BYTES, Math.min(FRONTEND_VIEWER_CACHE_MAX_BYTES, targetBytes));
 }
@@ -2413,6 +2579,7 @@ function frontendViewerCachedFrames(
         viewerNodeId?: string;
         frame?: number;
         channel?: string;
+        roi?: string;
         proxy?: string;
       };
       if (
@@ -2421,6 +2588,7 @@ function frontendViewerCachedFrames(
         parsed.scriptId === context.scriptId &&
         parsed.viewerNodeId === context.viewerNodeId &&
         parsed.channel === context.channel &&
+        parsed.roi === context.roi &&
         parsed.proxy === context.proxy &&
         typeof parsed.frame === "number"
       ) {
@@ -2435,7 +2603,13 @@ function frontendViewerCachedFrames(
 
 function viewerReadyCachedFrames(
   cache: FrontendViewerCacheState,
-  snapshot: { graph: ProjectGraph | null; project: Project | null; viewerNodeId: string; viewerChannel: string },
+  snapshot: {
+    graph: ProjectGraph | null;
+    project: Project | null;
+    viewerNodeId: string;
+    viewerChannel: string;
+    viewerRoi?: { x: number; y: number; width: number; height: number } | null;
+  },
   renderRevision: number,
 ) {
   return frontendViewerCachedFrames(cache, frontendCacheFrameContext(snapshot, renderRevision));

@@ -1,0 +1,844 @@
+{
+  "schema_version": "0.1.0",
+  "project_name": "LAL_105_523_0010_slapcomp",
+  "settings": {
+    "fps": 24,
+    "frame_start": 1001,
+    "frame_end": 1010,
+    "width": 4096,
+    "height": 3024,
+    "working_colorspace": "ACES2065-1",
+    "ocio_config": null,
+    "viewer_display": "sRGB - Display",
+    "viewer_view": "ACES 2.0 - SDR 100 nits (Rec.709)",
+    "proxy_enabled": true,
+    "viewer_max_width": 1280,
+    "viewer_max_height": 720,
+    "project_path": null,
+    "default_output_path": "E:\\opencomp_tests\\LAL_105_523_0010\\OUT\\LAL_105_523_0010_SLAPCOMP_OPENCOMP_####.exr",
+    "cache_enabled": true,
+    "auto_refresh": true,
+    "tile_rendering_enabled": true,
+    "tile_height": 64,
+    "tile_workers": 4,
+    "render_workers": 4,
+    "read_workers": 4,
+    "viewer_tile_lanes": 3,
+    "execution_backend": "auto",
+    "image_io_backend": "auto",
+    "gpu_memory_limit_mb": 2048,
+    "gpu_warm_neighbor_frames": 2
+  },
+  "graph": {
+    "nodes": {
+      "Plate_Read": {
+        "id": "Plate_Read",
+        "type": "Read",
+        "name": "Plate_Read",
+        "position": [
+          -360,
+          -620
+        ],
+        "params": {
+          "path": "E:\\opencomp_tests\\LAL_105_523_0010\\PLATE\\LAL_105_523_0010_####.exr",
+          "colorspace": "ACES2065-1",
+          "frame_start": 1001,
+          "frame_end": 1010,
+          "before": "hold",
+          "after": "hold",
+          "missing_frames": "error",
+          "auto_alpha": true
+        },
+        "param_expressions": {},
+        "inputs": {},
+        "outputs": {
+          "out": "ImageFrame"
+        }
+      },
+      "Plate_Format": {
+        "id": "Plate_Format",
+        "type": "Reformat",
+        "name": "Plate_Format",
+        "position": [
+          -360,
+          -470
+        ],
+        "params": {
+          "width": 4096,
+          "height": 3024,
+          "resize": "distort"
+        },
+        "param_expressions": {},
+        "inputs": {},
+        "outputs": {
+          "out": "ImageFrame"
+        }
+      },
+      "Main3D_Read": {
+        "id": "Main3D_Read",
+        "type": "Read",
+        "name": "Main3D_Read",
+        "position": [
+          40,
+          -620
+        ],
+        "params": {
+          "path": "E:\\opencomp_tests\\LAL_105_523_0010\\3D\\LAL_105_523_0010_3D_v003.####.exr",
+          "colorspace": "ACES2065-1",
+          "frame_start": 1001,
+          "frame_end": 1010,
+          "before": "hold",
+          "after": "hold",
+          "missing_frames": "error",
+          "auto_alpha": true
+        },
+        "param_expressions": {},
+        "inputs": {},
+        "outputs": {
+          "out": "ImageFrame"
+        }
+      },
+      "Main3D_Format": {
+        "id": "Main3D_Format",
+        "type": "Reformat",
+        "name": "Main3D_Format",
+        "position": [
+          40,
+          -470
+        ],
+        "params": {
+          "width": 4096,
+          "height": 3024,
+          "resize": "distort"
+        },
+        "param_expressions": {},
+        "inputs": {},
+        "outputs": {
+          "out": "ImageFrame"
+        }
+      },
+      "Main3D_Grade": {
+        "id": "Main3D_Grade",
+        "type": "Grade",
+        "name": "Main3D_Grade",
+        "position": [
+          40,
+          -330
+        ],
+        "params": {
+          "gain": 1,
+          "offset": 0,
+          "gamma": 1
+        },
+        "param_expressions": {},
+        "inputs": {},
+        "outputs": {
+          "out": "ImageFrame"
+        }
+      },
+      "Clothes3D_Read": {
+        "id": "Clothes3D_Read",
+        "type": "Read",
+        "name": "Clothes3D_Read",
+        "position": [
+          430,
+          -620
+        ],
+        "params": {
+          "path": "E:\\opencomp_tests\\LAL_105_523_0010\\3D\\LAL_105_523_0010_3D_CLOTHES_01.####.exr",
+          "colorspace": "ACES2065-1",
+          "frame_start": 1001,
+          "frame_end": 1010,
+          "before": "hold",
+          "after": "hold",
+          "missing_frames": "error",
+          "auto_alpha": true
+        },
+        "param_expressions": {},
+        "inputs": {},
+        "outputs": {
+          "out": "ImageFrame"
+        }
+      },
+      "Clothes3D_Format": {
+        "id": "Clothes3D_Format",
+        "type": "Reformat",
+        "name": "Clothes3D_Format",
+        "position": [
+          430,
+          -470
+        ],
+        "params": {
+          "width": 4096,
+          "height": 3024,
+          "resize": "distort"
+        },
+        "param_expressions": {},
+        "inputs": {},
+        "outputs": {
+          "out": "ImageFrame"
+        }
+      },
+      "Clothes3D_Grade": {
+        "id": "Clothes3D_Grade",
+        "type": "Grade",
+        "name": "Clothes3D_Grade",
+        "position": [
+          430,
+          -330
+        ],
+        "params": {
+          "gain": 1,
+          "offset": 0,
+          "gamma": 1
+        },
+        "param_expressions": {},
+        "inputs": {},
+        "outputs": {
+          "out": "ImageFrame"
+        }
+      },
+      "Merge_Main3D_Over_Plate": {
+        "id": "Merge_Main3D_Over_Plate",
+        "type": "Merge",
+        "name": "Merge_Main3D_Over_Plate",
+        "position": [
+          -120,
+          -150
+        ],
+        "params": {
+          "operation": "over",
+          "mix": 1,
+          "bbox": "union",
+          "metadata_from": "b"
+        },
+        "param_expressions": {},
+        "inputs": {},
+        "outputs": {
+          "out": "ImageFrame"
+        }
+      },
+      "Merge_Clothes_Over_Main": {
+        "id": "Merge_Clothes_Over_Main",
+        "type": "Merge",
+        "name": "Merge_Clothes_Over_Main",
+        "position": [
+          -120,
+          20
+        ],
+        "params": {
+          "operation": "over",
+          "mix": 1,
+          "bbox": "union",
+          "metadata_from": "b"
+        },
+        "param_expressions": {},
+        "inputs": {},
+        "outputs": {
+          "out": "ImageFrame"
+        }
+      },
+      "Final_SlapGrade": {
+        "id": "Final_SlapGrade",
+        "type": "Grade",
+        "name": "Final_SlapGrade",
+        "position": [
+          -120,
+          190
+        ],
+        "params": {
+          "gain": 1,
+          "offset": 0,
+          "gamma": 1
+        },
+        "param_expressions": {},
+        "inputs": {},
+        "outputs": {
+          "out": "ImageFrame"
+        }
+      },
+      "Viewer1": {
+        "id": "Viewer1",
+        "type": "Viewer",
+        "name": "Viewer1",
+        "position": [
+          265.6119493979576,
+          360.8550525834476
+        ],
+        "params": {
+          "active_input": "1"
+        },
+        "param_expressions": {},
+        "inputs": {},
+        "outputs": {
+          "out": "ImageFrame"
+        }
+      },
+      "Write_EXR": {
+        "id": "Write_EXR",
+        "type": "Write",
+        "name": "Write_EXR",
+        "position": [
+          -120,
+          550
+        ],
+        "params": {
+          "path": "E:\\opencomp_tests\\LAL_105_523_0010\\OUT\\LAL_105_523_0010_SLAPCOMP_OPENCOMP_####.exr",
+          "channels": "rgba",
+          "overwrite": true,
+          "create_directories": true,
+          "metadata": "all"
+        },
+        "param_expressions": {},
+        "inputs": {},
+        "outputs": {
+          "out": "ImageFrame"
+        }
+      }
+    },
+    "edges": [
+      {
+        "id": "script-Plate_Read-Plate_Format-in",
+        "source_node": "Plate_Read",
+        "source_socket": "out",
+        "target_node": "Plate_Format",
+        "target_socket": "in"
+      },
+      {
+        "id": "script-Main3D_Read-Main3D_Format-in",
+        "source_node": "Main3D_Read",
+        "source_socket": "out",
+        "target_node": "Main3D_Format",
+        "target_socket": "in"
+      },
+      {
+        "id": "script-Main3D_Format-Main3D_Grade-in",
+        "source_node": "Main3D_Format",
+        "source_socket": "out",
+        "target_node": "Main3D_Grade",
+        "target_socket": "in"
+      },
+      {
+        "id": "script-Clothes3D_Read-Clothes3D_Format-in",
+        "source_node": "Clothes3D_Read",
+        "source_socket": "out",
+        "target_node": "Clothes3D_Format",
+        "target_socket": "in"
+      },
+      {
+        "id": "script-Clothes3D_Format-Clothes3D_Grade-in",
+        "source_node": "Clothes3D_Format",
+        "source_socket": "out",
+        "target_node": "Clothes3D_Grade",
+        "target_socket": "in"
+      },
+      {
+        "id": "script-Plate_Format-Merge_Main3D_Over_Plate-b",
+        "source_node": "Plate_Format",
+        "source_socket": "out",
+        "target_node": "Merge_Main3D_Over_Plate",
+        "target_socket": "b"
+      },
+      {
+        "id": "script-Main3D_Grade-Merge_Main3D_Over_Plate-a",
+        "source_node": "Main3D_Grade",
+        "source_socket": "out",
+        "target_node": "Merge_Main3D_Over_Plate",
+        "target_socket": "a"
+      },
+      {
+        "id": "script-Merge_Main3D_Over_Plate-Merge_Clothes_Over_Main-b",
+        "source_node": "Merge_Main3D_Over_Plate",
+        "source_socket": "out",
+        "target_node": "Merge_Clothes_Over_Main",
+        "target_socket": "b"
+      },
+      {
+        "id": "script-Clothes3D_Grade-Merge_Clothes_Over_Main-a",
+        "source_node": "Clothes3D_Grade",
+        "source_socket": "out",
+        "target_node": "Merge_Clothes_Over_Main",
+        "target_socket": "a"
+      },
+      {
+        "id": "script-Merge_Clothes_Over_Main-Final_SlapGrade-in",
+        "source_node": "Merge_Clothes_Over_Main",
+        "source_socket": "out",
+        "target_node": "Final_SlapGrade",
+        "target_socket": "in"
+      },
+      {
+        "id": "script-Plate_Format-Viewer1-2",
+        "source_node": "Plate_Format",
+        "source_socket": "out",
+        "target_node": "Viewer1",
+        "target_socket": "2"
+      },
+      {
+        "id": "script-Merge_Main3D_Over_Plate-Viewer1-3",
+        "source_node": "Merge_Main3D_Over_Plate",
+        "source_socket": "out",
+        "target_node": "Viewer1",
+        "target_socket": "3"
+      },
+      {
+        "id": "script-Main3D_Grade-Viewer1-4",
+        "source_node": "Main3D_Grade",
+        "source_socket": "out",
+        "target_node": "Viewer1",
+        "target_socket": "4"
+      },
+      {
+        "id": "script-Clothes3D_Grade-Viewer1-5",
+        "source_node": "Clothes3D_Grade",
+        "source_socket": "out",
+        "target_node": "Viewer1",
+        "target_socket": "5"
+      },
+      {
+        "id": "script-Final_SlapGrade-Write_EXR-in",
+        "source_node": "Final_SlapGrade",
+        "source_socket": "out",
+        "target_node": "Write_EXR",
+        "target_socket": "in"
+      },
+      {
+        "id": "viewer-Viewer1-1-Final_SlapGrade",
+        "source_node": "Final_SlapGrade",
+        "source_socket": "out",
+        "target_node": "Viewer1",
+        "target_socket": "1"
+      }
+    ]
+  },
+  "script_tabs": [
+    {
+      "id": "main",
+      "name": "Comp 1",
+      "graph": {
+        "nodes": {
+          "Plate_Read": {
+            "id": "Plate_Read",
+            "type": "Read",
+            "name": "Plate_Read",
+            "position": [
+              -360,
+              -620
+            ],
+            "params": {
+              "path": "E:\\opencomp_tests\\LAL_105_523_0010\\PLATE\\LAL_105_523_0010_####.exr",
+              "colorspace": "ACES2065-1",
+              "frame_start": 1001,
+              "frame_end": 1010,
+              "before": "hold",
+              "after": "hold",
+              "missing_frames": "error",
+              "auto_alpha": true
+            },
+            "param_expressions": {},
+            "inputs": {},
+            "outputs": {
+              "out": "ImageFrame"
+            }
+          },
+          "Plate_Format": {
+            "id": "Plate_Format",
+            "type": "Reformat",
+            "name": "Plate_Format",
+            "position": [
+              -360,
+              -470
+            ],
+            "params": {
+              "width": 4096,
+              "height": 3024,
+              "resize": "distort"
+            },
+            "param_expressions": {},
+            "inputs": {},
+            "outputs": {
+              "out": "ImageFrame"
+            }
+          },
+          "Main3D_Read": {
+            "id": "Main3D_Read",
+            "type": "Read",
+            "name": "Main3D_Read",
+            "position": [
+              40,
+              -620
+            ],
+            "params": {
+              "path": "E:\\opencomp_tests\\LAL_105_523_0010\\3D\\LAL_105_523_0010_3D_v003.####.exr",
+              "colorspace": "ACES2065-1",
+              "frame_start": 1001,
+              "frame_end": 1010,
+              "before": "hold",
+              "after": "hold",
+              "missing_frames": "error",
+              "auto_alpha": true
+            },
+            "param_expressions": {},
+            "inputs": {},
+            "outputs": {
+              "out": "ImageFrame"
+            }
+          },
+          "Main3D_Format": {
+            "id": "Main3D_Format",
+            "type": "Reformat",
+            "name": "Main3D_Format",
+            "position": [
+              40,
+              -470
+            ],
+            "params": {
+              "width": 4096,
+              "height": 3024,
+              "resize": "distort"
+            },
+            "param_expressions": {},
+            "inputs": {},
+            "outputs": {
+              "out": "ImageFrame"
+            }
+          },
+          "Main3D_Grade": {
+            "id": "Main3D_Grade",
+            "type": "Grade",
+            "name": "Main3D_Grade",
+            "position": [
+              40,
+              -330
+            ],
+            "params": {
+              "gain": 1,
+              "offset": 0,
+              "gamma": 1
+            },
+            "param_expressions": {},
+            "inputs": {},
+            "outputs": {
+              "out": "ImageFrame"
+            }
+          },
+          "Clothes3D_Read": {
+            "id": "Clothes3D_Read",
+            "type": "Read",
+            "name": "Clothes3D_Read",
+            "position": [
+              430,
+              -620
+            ],
+            "params": {
+              "path": "E:\\opencomp_tests\\LAL_105_523_0010\\3D\\LAL_105_523_0010_3D_CLOTHES_01.####.exr",
+              "colorspace": "ACES2065-1",
+              "frame_start": 1001,
+              "frame_end": 1010,
+              "before": "hold",
+              "after": "hold",
+              "missing_frames": "error",
+              "auto_alpha": true
+            },
+            "param_expressions": {},
+            "inputs": {},
+            "outputs": {
+              "out": "ImageFrame"
+            }
+          },
+          "Clothes3D_Format": {
+            "id": "Clothes3D_Format",
+            "type": "Reformat",
+            "name": "Clothes3D_Format",
+            "position": [
+              430,
+              -470
+            ],
+            "params": {
+              "width": 4096,
+              "height": 3024,
+              "resize": "distort"
+            },
+            "param_expressions": {},
+            "inputs": {},
+            "outputs": {
+              "out": "ImageFrame"
+            }
+          },
+          "Clothes3D_Grade": {
+            "id": "Clothes3D_Grade",
+            "type": "Grade",
+            "name": "Clothes3D_Grade",
+            "position": [
+              430,
+              -330
+            ],
+            "params": {
+              "gain": 1,
+              "offset": 0,
+              "gamma": 1
+            },
+            "param_expressions": {},
+            "inputs": {},
+            "outputs": {
+              "out": "ImageFrame"
+            }
+          },
+          "Merge_Main3D_Over_Plate": {
+            "id": "Merge_Main3D_Over_Plate",
+            "type": "Merge",
+            "name": "Merge_Main3D_Over_Plate",
+            "position": [
+              -120,
+              -150
+            ],
+            "params": {
+              "operation": "over",
+              "mix": 1,
+              "bbox": "union",
+              "metadata_from": "b"
+            },
+            "param_expressions": {},
+            "inputs": {},
+            "outputs": {
+              "out": "ImageFrame"
+            }
+          },
+          "Merge_Clothes_Over_Main": {
+            "id": "Merge_Clothes_Over_Main",
+            "type": "Merge",
+            "name": "Merge_Clothes_Over_Main",
+            "position": [
+              -120,
+              20
+            ],
+            "params": {
+              "operation": "over",
+              "mix": 1,
+              "bbox": "union",
+              "metadata_from": "b"
+            },
+            "param_expressions": {},
+            "inputs": {},
+            "outputs": {
+              "out": "ImageFrame"
+            }
+          },
+          "Final_SlapGrade": {
+            "id": "Final_SlapGrade",
+            "type": "Grade",
+            "name": "Final_SlapGrade",
+            "position": [
+              -120,
+              190
+            ],
+            "params": {
+              "gain": 1,
+              "offset": 0,
+              "gamma": 1
+            },
+            "param_expressions": {},
+            "inputs": {},
+            "outputs": {
+              "out": "ImageFrame"
+            }
+          },
+          "Viewer1": {
+            "id": "Viewer1",
+            "type": "Viewer",
+            "name": "Viewer1",
+            "position": [
+              265.6119493979576,
+              360.8550525834476
+            ],
+            "params": {
+              "active_input": "1"
+            },
+            "param_expressions": {},
+            "inputs": {},
+            "outputs": {
+              "out": "ImageFrame"
+            }
+          },
+          "Write_EXR": {
+            "id": "Write_EXR",
+            "type": "Write",
+            "name": "Write_EXR",
+            "position": [
+              -120,
+              550
+            ],
+            "params": {
+              "path": "E:\\opencomp_tests\\LAL_105_523_0010\\OUT\\LAL_105_523_0010_SLAPCOMP_OPENCOMP_####.exr",
+              "channels": "rgba",
+              "overwrite": true,
+              "create_directories": true,
+              "metadata": "all"
+            },
+            "param_expressions": {},
+            "inputs": {},
+            "outputs": {
+              "out": "ImageFrame"
+            }
+          }
+        },
+        "edges": [
+          {
+            "id": "script-Plate_Read-Plate_Format-in",
+            "source_node": "Plate_Read",
+            "source_socket": "out",
+            "target_node": "Plate_Format",
+            "target_socket": "in"
+          },
+          {
+            "id": "script-Main3D_Read-Main3D_Format-in",
+            "source_node": "Main3D_Read",
+            "source_socket": "out",
+            "target_node": "Main3D_Format",
+            "target_socket": "in"
+          },
+          {
+            "id": "script-Main3D_Format-Main3D_Grade-in",
+            "source_node": "Main3D_Format",
+            "source_socket": "out",
+            "target_node": "Main3D_Grade",
+            "target_socket": "in"
+          },
+          {
+            "id": "script-Clothes3D_Read-Clothes3D_Format-in",
+            "source_node": "Clothes3D_Read",
+            "source_socket": "out",
+            "target_node": "Clothes3D_Format",
+            "target_socket": "in"
+          },
+          {
+            "id": "script-Clothes3D_Format-Clothes3D_Grade-in",
+            "source_node": "Clothes3D_Format",
+            "source_socket": "out",
+            "target_node": "Clothes3D_Grade",
+            "target_socket": "in"
+          },
+          {
+            "id": "script-Plate_Format-Merge_Main3D_Over_Plate-b",
+            "source_node": "Plate_Format",
+            "source_socket": "out",
+            "target_node": "Merge_Main3D_Over_Plate",
+            "target_socket": "b"
+          },
+          {
+            "id": "script-Main3D_Grade-Merge_Main3D_Over_Plate-a",
+            "source_node": "Main3D_Grade",
+            "source_socket": "out",
+            "target_node": "Merge_Main3D_Over_Plate",
+            "target_socket": "a"
+          },
+          {
+            "id": "script-Merge_Main3D_Over_Plate-Merge_Clothes_Over_Main-b",
+            "source_node": "Merge_Main3D_Over_Plate",
+            "source_socket": "out",
+            "target_node": "Merge_Clothes_Over_Main",
+            "target_socket": "b"
+          },
+          {
+            "id": "script-Clothes3D_Grade-Merge_Clothes_Over_Main-a",
+            "source_node": "Clothes3D_Grade",
+            "source_socket": "out",
+            "target_node": "Merge_Clothes_Over_Main",
+            "target_socket": "a"
+          },
+          {
+            "id": "script-Merge_Clothes_Over_Main-Final_SlapGrade-in",
+            "source_node": "Merge_Clothes_Over_Main",
+            "source_socket": "out",
+            "target_node": "Final_SlapGrade",
+            "target_socket": "in"
+          },
+          {
+            "id": "script-Plate_Format-Viewer1-2",
+            "source_node": "Plate_Format",
+            "source_socket": "out",
+            "target_node": "Viewer1",
+            "target_socket": "2"
+          },
+          {
+            "id": "script-Merge_Main3D_Over_Plate-Viewer1-3",
+            "source_node": "Merge_Main3D_Over_Plate",
+            "source_socket": "out",
+            "target_node": "Viewer1",
+            "target_socket": "3"
+          },
+          {
+            "id": "script-Main3D_Grade-Viewer1-4",
+            "source_node": "Main3D_Grade",
+            "source_socket": "out",
+            "target_node": "Viewer1",
+            "target_socket": "4"
+          },
+          {
+            "id": "script-Clothes3D_Grade-Viewer1-5",
+            "source_node": "Clothes3D_Grade",
+            "source_socket": "out",
+            "target_node": "Viewer1",
+            "target_socket": "5"
+          },
+          {
+            "id": "script-Final_SlapGrade-Write_EXR-in",
+            "source_node": "Final_SlapGrade",
+            "source_socket": "out",
+            "target_node": "Write_EXR",
+            "target_socket": "in"
+          },
+          {
+            "id": "viewer-Viewer1-1-Final_SlapGrade",
+            "source_node": "Final_SlapGrade",
+            "source_socket": "out",
+            "target_node": "Viewer1",
+            "target_socket": "1"
+          }
+        ]
+      },
+      "code": "import glob\nimport re\n\nSHOT_ROOT = r\"E:\\opencomp_tests\\LAL_105_523_0010\"\n\nPLATE_PATH = rf\"{SHOT_ROOT}\\PLATE\\LAL_105_523_0010_####.exr\"\nMAIN_3D_PATH = rf\"{SHOT_ROOT}\\3D\\LAL_105_523_0010_3D_v003.####.exr\"\nCLOTHES_3D_PATH = rf\"{SHOT_ROOT}\\3D\\LAL_105_523_0010_3D_CLOTHES_01.####.exr\"\nWRITE_PATH = rf\"{SHOT_ROOT}\\OUT\\LAL_105_523_0010_SLAPCOMP_OPENCOMP_####.exr\"\n\nROOT_WIDTH = 4096\nROOT_HEIGHT = 3024\nWORKING_COLORSPACE = \"ACES2065-1\"\nREAD_COLORSPACE = \"ACES2065-1\"\n\n\ndef detect_frame_range(pattern, fallback=(1001, 1010)):\n    frame_regex = re.compile(r\"(\\d+)(?=\\.[^.\\\\/]+$)\")\n    frames = []\n    for path in glob.glob(pattern.replace(\"####\", \"*\")):\n        match = frame_regex.search(path.replace(\"\\\\\", \"/\"))\n        if match:\n            frames.append(int(match.group(1)))\n    if not frames:\n        return fallback\n    return min(frames), max(frames)\n\n\ndef remove_existing_graph():\n    for node in list(opencomp.nodes()):\n        node.delete()\n\n\nfirst_frame, last_frame = detect_frame_range(PLATE_PATH)\nremove_existing_graph()\n\nroot = opencomp.node(\"root\")\nroot.value(\"name\").setValue(\"LAL_105_523_0010_slapcomp\")\nroot.value(\"first_frame\").setValue(first_frame)\nroot.value(\"last_frame\").setValue(last_frame)\nroot.value(\"width\").setValue(ROOT_WIDTH)\nroot.value(\"height\").setValue(ROOT_HEIGHT)\nroot.value(\"working_colorspace\").setValue(WORKING_COLORSPACE)\nroot.value(\"proxy_enabled\").setValue(True)\nroot.value(\"viewer_max_width\").setValue(1280)\nroot.value(\"viewer_max_height\").setValue(720)\nroot.value(\"default_output_path\").setValue(WRITE_PATH)\n\nplate_read = opencomp.create_node(\n    \"Read\",\n    name=\"Plate_Read\",\n    position=(-360, -620),\n    path=PLATE_PATH,\n    colorspace=READ_COLORSPACE,\n    frame_start=first_frame,\n    frame_end=last_frame,\n    before=\"hold\",\n    after=\"hold\",\n    missing_frames=\"error\",\n    auto_alpha=True,\n)\n\nplate_format = opencomp.create_node(\n    \"Reformat\",\n    name=\"Plate_Format\",\n    position=(-360, -470),\n    width=ROOT_WIDTH,\n    height=ROOT_HEIGHT,\n    resize=\"distort\",\n)\nplate_format.setInput(\"in\", plate_read)\n\nmain_3d_read = opencomp.create_node(\n    \"Read\",\n    name=\"Main3D_Read\",\n    position=(40, -620),\n    path=MAIN_3D_PATH,\n    colorspace=READ_COLORSPACE,\n    frame_start=first_frame,\n    frame_end=last_frame,\n    before=\"hold\",\n    after=\"hold\",\n    missing_frames=\"error\",\n    auto_alpha=True,\n)\n\nmain_3d_format = opencomp.create_node(\n    \"Reformat\",\n    name=\"Main3D_Format\",\n    position=(40, -470),\n    width=ROOT_WIDTH,\n    height=ROOT_HEIGHT,\n    resize=\"distort\",\n)\nmain_3d_format.setInput(\"in\", main_3d_read)\n\nmain_3d_grade = opencomp.create_node(\n    \"Grade\",\n    name=\"Main3D_Grade\",\n    position=(40, -330),\n    gain=1.0,\n    offset=0.0,\n    gamma=1.0,\n)\nmain_3d_grade.setInput(\"in\", main_3d_format)\n\nclothes_read = opencomp.create_node(\n    \"Read\",\n    name=\"Clothes3D_Read\",\n    position=(430, -620),\n    path=CLOTHES_3D_PATH,\n    colorspace=READ_COLORSPACE,\n    frame_start=first_frame,\n    frame_end=last_frame,\n    before=\"hold\",\n    after=\"hold\",\n    missing_frames=\"error\",\n    auto_alpha=True,\n)\n\nclothes_format = opencomp.create_node(\n    \"Reformat\",\n    name=\"Clothes3D_Format\",\n    position=(430, -470),\n    width=ROOT_WIDTH,\n    height=ROOT_HEIGHT,\n    resize=\"distort\",\n)\nclothes_format.setInput(\"in\", clothes_read)\n\nclothes_grade = opencomp.create_node(\n    \"Grade\",\n    name=\"Clothes3D_Grade\",\n    position=(430, -330),\n    gain=1.0,\n    offset=0.0,\n    gamma=1.0,\n)\nclothes_grade.setInput(\"in\", clothes_format)\n\nmerge_main = opencomp.create_node(\n    \"Merge\",\n    name=\"Merge_Main3D_Over_Plate\",\n    position=(-120, -150),\n    operation=\"over\",\n    mix=1.0,\n    bbox=\"union\",\n    metadata_from=\"b\",\n)\nmerge_main.setInput(\"b\", plate_format)\nmerge_main.setInput(\"a\", main_3d_grade)\n\nmerge_clothes = opencomp.create_node(\n    \"Merge\",\n    name=\"Merge_Clothes_Over_Main\",\n    position=(-120, 20),\n    operation=\"over\",\n    mix=1.0,\n    bbox=\"union\",\n    metadata_from=\"b\",\n)\nmerge_clothes.setInput(\"b\", merge_main)\nmerge_clothes.setInput(\"a\", clothes_grade)\n\nfinal_grade = opencomp.create_node(\n    \"Grade\",\n    name=\"Final_SlapGrade\",\n    position=(-120, 190),\n    gain=1.0,\n    offset=0.0,\n    gamma=1.0,\n)\nfinal_grade.setInput(\"in\", merge_clothes)\n\nviewer = opencomp.create_node(\n    \"Viewer\",\n    name=\"Viewer1\",\n    position=(-120, 370),\n    active_input=\"1\",\n)\nviewer.setInput(\"1\", final_grade)\nviewer.setInput(\"2\", plate_format)\nviewer.setInput(\"3\", merge_main)\nviewer.setInput(\"4\", main_3d_grade)\nviewer.setInput(\"5\", clothes_grade)\n\nwrite = opencomp.create_node(\n    \"Write\",\n    name=\"Write_EXR\",\n    position=(-120, 550),\n    path=WRITE_PATH,\n    channels=\"rgba\",\n    overwrite=True,\n    create_directories=True,\n    metadata=\"all\",\n)\nwrite.setInput(\"in\", final_grade)\n\nprint(\"Created LAL_105_523_0010 slapcomp\")\nprint(f\"Frame range: {first_frame}-{last_frame}\")\nprint(\"Viewer inputs: 1 final, 2 plate, 3 plate+main3D, 4 main3D, 5 clothes3D\")\nprint(f\"Write node: {write.id} -> {WRITE_PATH}\")",
+      "path": null,
+      "startup_scripts": [],
+      "kind": "comp"
+    }
+  ],
+  "active_script_id": "main",
+  "preferences": {
+    "autosave_seconds": 300,
+    "idle_autosave_seconds": 5,
+    "cache_memory_limit_mb": 1024,
+    "viewer_zoom_speed": 1.1,
+    "wheel_zoom_enabled": true,
+    "auto_connect_new_nodes": true,
+    "playback_transfer_mode": "hybrid-preview",
+    "viewer_transfer_precision": "float16",
+    "read_preload_enabled": true,
+    "read_preload_max_frames": 6,
+    "default_read_colorspace": "ACES2065-1",
+    "custom_init_scripts": [],
+    "path_substitutions": [],
+    "hotkeys": {
+      "add_read": "r",
+      "add_write": "w",
+      "add_merge": "m",
+      "add_shuffle": "s",
+      "add_group": "g",
+      "toggle_disable": "d",
+      "refresh_viewer": "u",
+      "fit_viewer": "f"
+    }
+  },
+  "plugin_menu": [
+    {
+      "label": "Run Python Script",
+      "command": "python_script",
+      "path": ""
+    },
+    {
+      "label": "Reload Menu Plugins",
+      "command": "reload_plugins"
+    }
+  ],
+  "startup_scripts": []
+}

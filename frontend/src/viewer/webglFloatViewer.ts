@@ -294,7 +294,7 @@ export class WebglFloatViewerRenderer {
     setTextureParameters(gl);
     const storageKey = `${frame.header.width}x${frame.header.height}:${frame.header.dtype}`;
     const textureFormat = textureFormatForFrame(gl, frame);
-    const resetStorage = currentStorageKey !== storageKey || currentData !== frame.pixels;
+    const resetStorage = currentStorageKey !== storageKey;
     if (resetStorage) {
       gl.texImage2D(
         gl.TEXTURE_2D,

@@ -75,6 +75,8 @@ type AppState = {
   addLog: (level: LogLevel, message: string) => void;
 };
 
+const DEFAULT_READ_SOURCE = "builtin://gradient";
+
 export const useAppStore = create<AppState>((set, get) => ({
   backendStatus: "checking",
   project: null,
@@ -330,7 +332,7 @@ function defaultParamsFor(type: string): Record<string, unknown> {
   switch (type) {
     case "Read":
       return {
-        path: "E:\\Windows-Shortcuts\\Downloads\\opencomp_studio_codex_docs\\LAL_101_101_0010_####.exr",
+        path: DEFAULT_READ_SOURCE,
         colorspace: "ACES2065-1",
         localization_policy: "from auto-localize path",
         proxy: "",

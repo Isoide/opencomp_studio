@@ -12,8 +12,9 @@ The current design is intentionally close to a Nuke-like model: a directed node 
 - Pydantic: project, graph, settings, request, and API response models.
 - NumPy: core in-memory image representation and most pixel math.
 - Pillow: PNG/JPG read/write, PNG encode, and float-plane bilinear resize.
-- OpenEXR Python bindings, optional dependency: EXR read/write.
-- PyOpenColorIO or opencolorio, optional dependency: OCIO CPU processors and GPU shader generation.
+- OpenEXR Python bindings, optional dependency: EXR read/write fallback.
+- OpenImageIO Python bindings, optional dependency: preferred EXR read/write backend and preferred OCIO execution path.
+- PyOpenColorIO or opencolorio, optional dependency: OCIO config access, CPU fallback processors, and GPU shader generation.
 - Python `asyncio.to_thread`: keeps FastAPI request handlers responsive while CPU work runs in worker threads.
 - `ThreadPoolExecutor`: row/tile parallelism for selected node operations.
 
@@ -54,7 +55,7 @@ Supported sources:
 
 - `builtin://gradient`: generated test source.
 - PNG/JPG/JPEG: loaded through Pillow and normalized to float RGBA.
-- EXR: loaded through OpenEXR Python bindings.
+- EXR: loaded through OpenImageIO when available, with OpenEXR fallback retained.
 
 Sequence expansion supports:
 
@@ -70,8 +71,9 @@ E:\opencomp_tests\shot\PLATE\shot_####.exr
 
 For EXR:
 
-- OpenEXR v3 `OpenEXR.File` is preferred.
-- Legacy `OpenEXR.InputFile` is used as fallback.
+- OpenImageIO is the preferred reader backend when installed.
+- OpenEXR v3 `OpenEXR.File` remains the fallback backend.
+- Legacy `OpenEXR.InputFile` is still used for the exact single-channel fast path and as the final compatibility fallback.
 - `displayWindow` and `dataWindow` are parsed.
 - Pixel aspect ratio is read from EXR metadata.
 - Sparse EXR data windows are expanded into the display window so compositing alignment works.
@@ -99,7 +101,7 @@ Write node evaluation is implemented by `backend/opencomp/nodes/write.py` and `b
 
 Supported outputs:
 
-- EXR: OpenEXR, float channels, ZIP compression by default.
+- EXR: OpenImageIO preferred, OpenEXR fallback, float channels, ZIP compression by default.
 - PNG: Pillow, 8-bit RGBA.
 - JPG/JPEG: Pillow, 8-bit RGB.
 
@@ -123,7 +125,8 @@ Current behavior:
 - Auto-loads a configured `.ocio`, a builtin OCIO config, or the current OCIO config.
 - Prefers ACES 2.0 builtin configs when available.
 - Exposes color spaces, displays, and views through `/api/color/config`.
-- Uses CPU OCIO processors for backend colorspace conversion and CPU PNG viewer fallback.
+- Prefers OpenImageIO for backend colorspace conversion and display/view transforms when it is available.
+- Uses PyOpenColorIO CPU processors as the compatibility fallback.
 - Generates OCIO GPU display shader text through `/api/color/gpu-shader`.
 - The frontend WebGL viewer can apply viewer process and OCIO shader on the GPU.
 
@@ -466,11 +469,11 @@ The largest remaining cold-frame costs are CPU EXR decode and full-resolution up
   - propagate proxy scale upstream
   - read lower-resolution mip/thumbnail where possible
   - avoid full 4K arrays for proxy playback
-- OpenImageIO integration:
-  - faster image I/O
-  - robust format support
-  - tiled reads
-  - metadata/channel handling
+- Deeper OpenImageIO integration:
+  - keep OIIO as the default EXR reader backend
+  - expand use of OIIO tiled and region reads
+  - evaluate OIIO C++ OCIO color conversion deeper in the processing path
+  - preserve OpenEXR fallback for compatibility-sensitive cases
 - C++ or Rust image core:
   - merge/grade/reformat kernels
   - SIMD/vectorized tile loops

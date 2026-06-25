@@ -84,3 +84,18 @@ def test_direct_tile_evaluator_reports_tile_cache() -> None:
 
     assert np.allclose(tile_a.data, tile_b.data)
     assert hits_after > hits_before
+
+
+def test_activity_scope_reports_foreground_and_background_nodes_separately() -> None:
+    evaluator = GraphEvaluator(settings=ProjectSettings(cache_enabled=True, tile_rendering_enabled=True))
+
+    with evaluator.node_runtime("Viewer1", "Viewer"):
+        snapshot = evaluator.cache_snapshot()
+        assert "Viewer1" in snapshot["node_activity"]["foreground_active_nodes"]
+        assert "Viewer1" not in snapshot["node_activity"]["background_active_nodes"]
+
+    with evaluator.activity_scope("background"):
+        with evaluator.node_runtime("Read1", "Read"):
+            snapshot = evaluator.cache_snapshot()
+            assert "Read1" in snapshot["node_activity"]["background_active_nodes"]
+            assert "Read1" not in snapshot["node_activity"]["foreground_active_nodes"]

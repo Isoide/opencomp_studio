@@ -18,11 +18,17 @@ opencomp = "opencomp.cli:main"
 [project.optional-dependencies]
 ocio = ["opencolorio>=2.5"]
 exr = ["OpenEXR>=3.4"]
+oiio = ["OpenImageIO>=3.1"]
+vulkan = ["vulkan>=1.3.275.1"]
 dev = ["pytest>=8.2", "httpx>=0.27", "ruff>=0.5"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = [
+    "unit: fast isolated tests for pure helpers, models, and small runtime slices",
+    "integration: broader tests that span API, renderer, scripting, IO, or optional backends",
+]
 
 [tool.ruff]
 line-length = 100

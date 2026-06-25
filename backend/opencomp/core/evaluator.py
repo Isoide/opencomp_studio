@@ -1,3 +1,10 @@
+"""Core graph evaluation, caching, and preview/runtime bookkeeping for OpenComp.
+
+This evaluator coordinates node execution order, image/time caching, preview
+generation, and execution-backend selection across CPU and Vulkan spans. It
+also collects runtime diagnostics and timings that drive the frontend status UI.
+"""
+
 from __future__ import annotations
 
 import hashlib
@@ -9,17 +16,19 @@ from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
-from typing import Any, Iterator
+from typing import Any, Iterator, Literal
 
 import numpy as np
 
 from opencomp.color.ocio_engine import OCIOColorEngine
 from opencomp.core.channel_demand import ChannelDemand, channel_demand_for_graph
 from opencomp.core.expressions import ExpressionResolver
+from opencomp.gpu.runtime import VulkanRuntime
 from opencomp.core.models import Edge, ImageFrame, Node, ProjectGraph, ProjectSettings, TileWindow
 from opencomp.core.perf_logging import emit_perf_event, perf_phase_logging_enabled, perf_preview_logging_enabled
 from opencomp.core.render_contract import (
     ExecutionPlan,
+    ExecutionPlanSpan,
     RenderRequest,
     RenderROI,
     build_execution_plan,
@@ -32,7 +41,7 @@ from opencomp.nodes.read import _mapped_frame, _range_frame, _read_channels
 
 CacheKey = tuple[str, int, str]
 PreviewCacheKey = tuple[str, int, str, str, str, str, int | None, int | None, str | None]
-FloatPreviewCacheKey = tuple[str, int, str, str, int | None, int | None]
+FloatPreviewCacheKey = tuple[str, int, str, str, int | None, int | None, str | None]
 TileCacheKey = tuple[str, int, str, int, int, int, int]
 PlanCacheKey = str
 SourceCacheKey = str
@@ -100,10 +109,19 @@ class FloatPreviewCacheEntry:
     colorspace: str
     source_width: int
     source_height: int
+    display_width: int
+    display_height: int
     pixel_aspect: float
     format_bbox: dict[str, int]
     data_window: dict[str, int]
     bytes: int
+    execution_backend: str = "cpu"
+    gpu_kernel_mode: str = "cpu_fallback"
+    gpu_upload_ms: float = 0.0
+    gpu_dispatch_ms: float = 0.0
+    gpu_download_ms: float = 0.0
+    gpu_resize_ms: float = 0.0
+    gpu_cache_hit: bool = False
 
 
 @dataclass(slots=True)
@@ -120,10 +138,23 @@ class SourceCacheEntry:
     signature: str
 
 
+@dataclass(frozen=True, slots=True)
+class PreviewExecutionTarget:
+    node_id: str
+    max_width: int | None = None
+    max_height: int | None = None
+
+    def cache_key(self) -> str | None:
+        if not self.max_width and not self.max_height:
+            return None
+        return f"{self.node_id}:{self.max_width or 0}x{self.max_height or 0}"
+
+
 @dataclass
 class GraphEvaluator:
     settings: ProjectSettings = field(default_factory=ProjectSettings)
     ocio: OCIOColorEngine | None = None
+    vulkan_runtime: VulkanRuntime | None = None
     max_cache_bytes: int = 1024 * 1024 * 1024
     max_preview_cache_bytes: int = 512 * 1024 * 1024
     max_float_preview_cache_bytes: int = 512 * 1024 * 1024
@@ -154,7 +185,11 @@ class GraphEvaluator:
     max_source_cache_bytes: int | None = None
     active_nodes: set[str] = field(default_factory=set)
     active_node_counts: dict[str, int] = field(default_factory=dict)
+    node_activity_counts: dict[str, dict[str, int]] = field(
+        default_factory=lambda: {"foreground": {}, "background": {}}
+    )
     node_timings: dict[str, dict[str, Any]] = field(default_factory=dict)
+    node_errors: dict[str, dict[str, Any]] = field(default_factory=dict)
     preview_timings: dict[str, dict[str, Any]] = field(default_factory=dict)
     phase_timings: list[dict[str, Any]] = field(default_factory=list)
     request_timings: list[dict[str, Any]] = field(default_factory=list)
@@ -168,6 +203,8 @@ class GraphEvaluator:
     def __post_init__(self) -> None:
         if self.ocio is None:
             self.ocio = OCIOColorEngine(self.settings.ocio_config)
+        if self.vulkan_runtime is None:
+            self.vulkan_runtime = VulkanRuntime(self.settings)
         if self.max_tile_cache_bytes is None:
             self.max_tile_cache_bytes = self.max_cache_bytes
         if self.max_source_cache_bytes is None:
@@ -190,7 +227,7 @@ class GraphEvaluator:
         demand = self._evaluation_channel_demand(graph, node_id, requested_channel, channel_demand)
         with self.channel_demand_scope(demand):
             output_signature = self.output_signature(graph, node_id, frame)
-            self.execution_plan_for(
+            plan = self.execution_plan_for(
                 graph,
                 RenderRequest(
                     node_id=node_id,
@@ -202,7 +239,8 @@ class GraphEvaluator:
                 eval_node_id=node_id,
                 output_signature=output_signature,
             )
-            return self._evaluate(graph, node_id, frame, visiting=set())
+            with self.execution_plan_scope(plan):
+                return self._evaluate(graph, node_id, frame, visiting=set())
 
     def evaluate_node_tile(
         self,
@@ -224,7 +262,7 @@ class GraphEvaluator:
         demand = self._evaluation_channel_demand(graph, node_id, requested_channel, channel_demand)
         with self.channel_demand_scope(demand):
             output_signature = self.output_signature(graph, node_id, frame)
-            self.execution_plan_for(
+            plan = self.execution_plan_for(
                 graph,
                 RenderRequest(
                     node_id=node_id,
@@ -237,7 +275,8 @@ class GraphEvaluator:
                 eval_node_id=node_id,
                 output_signature=output_signature,
             )
-            return self._evaluate_tile_cached(graph, node_id, frame, normalized, visiting=set())
+            with self.execution_plan_scope(plan):
+                return self._evaluate_tile_cached(graph, node_id, frame, normalized, visiting=set())
 
     def evaluate_render_request(self, graph: ProjectGraph, request: RenderRequest) -> ImageFrame:
         if request.node_id not in graph.nodes:
@@ -246,10 +285,11 @@ class GraphEvaluator:
         demand = self._evaluation_channel_demand(graph, request.node_id, requested_channel, None)
         with self.channel_demand_scope(demand):
             output_signature = self.output_signature(graph, request.node_id, request.frame)
-            self.execution_plan_for(graph, request, eval_node_id=request.node_id, output_signature=output_signature)
-            if request.roi is not None:
-                return self._evaluate_tile_cached(graph, request.node_id, request.frame, request.roi.to_tile_window(), visiting=set())
-            return self._evaluate(graph, request.node_id, request.frame, visiting=set())
+            plan = self.execution_plan_for(graph, request, eval_node_id=request.node_id, output_signature=output_signature)
+            with self.execution_plan_scope(plan):
+                if request.roi is not None:
+                    return self._evaluate_tile_cached(graph, request.node_id, request.frame, request.roi.to_tile_window(), visiting=set())
+                return self._evaluate(graph, request.node_id, request.frame, visiting=set())
 
     def execution_plan_for(
         self,
@@ -265,6 +305,8 @@ class GraphEvaluator:
             "base": base_key,
             "eval_node_id": resolved_eval_node,
             "output_signature": output_signature or "",
+            "execution_backend": self.settings.execution_backend,
+            "vulkan_available": bool(self.vulkan_runtime.available) if self.vulkan_runtime is not None else False,
         }
         cache_key = hashlib.sha1(json.dumps(cache_payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
         with self._lock:
@@ -288,6 +330,8 @@ class GraphEvaluator:
             output_signature=output_signature,
             eval_node_id=resolved_eval_node,
             tile_native_types=TILE_LOCAL_NODE_TYPES,
+            vulkan_supported_types=self.vulkan_runtime.supported_node_types if self.vulkan_runtime is not None else set(),
+            prefer_vulkan=self._prefer_vulkan_backend(request),
         )
         with self._lock:
             self.execution_plan_cache[cache_key] = plan
@@ -301,6 +345,64 @@ class GraphEvaluator:
         )
         return plan
 
+    @contextmanager
+    def execution_plan_scope(self, plan: ExecutionPlan | None) -> Iterator[None]:
+        previous = getattr(self._thread_state, "execution_plan", None)
+        self._thread_state.execution_plan = plan
+        try:
+            yield
+        finally:
+            if previous is None:
+                if hasattr(self._thread_state, "execution_plan"):
+                    delattr(self._thread_state, "execution_plan")
+            else:
+                self._thread_state.execution_plan = previous
+
+    def _current_execution_plan(self) -> ExecutionPlan | None:
+        return getattr(self._thread_state, "execution_plan", None)
+
+    @contextmanager
+    def preview_target_scope(
+        self,
+        node_id: str,
+        max_width: int | None = None,
+        max_height: int | None = None,
+    ) -> Iterator[None]:
+        previous = getattr(self._thread_state, "preview_target", None)
+        target = PreviewExecutionTarget(node_id=node_id, max_width=max_width, max_height=max_height)
+        if target.cache_key() is None:
+            target = None
+        self._thread_state.preview_target = target
+        try:
+            yield
+        finally:
+            if previous is None:
+                if hasattr(self._thread_state, "preview_target"):
+                    delattr(self._thread_state, "preview_target")
+            else:
+                self._thread_state.preview_target = previous
+
+    def _current_preview_target(self) -> PreviewExecutionTarget | None:
+        return getattr(self._thread_state, "preview_target", None)
+
+    def _prefer_vulkan_backend(self, request: RenderRequest) -> bool:
+        if self.vulkan_runtime is None or not self.vulkan_runtime.enabled:
+            return False
+        if self.settings.execution_backend == "cpu":
+            return False
+        if self.settings.execution_backend == "vulkan":
+            return self.vulkan_runtime.available
+        return self.vulkan_runtime.available and request.storage in {"ram", "frontend", "gpu"}
+
+    def _find_vulkan_span_for_node(self, node_id: str) -> ExecutionPlanSpan | None:
+        plan = self._current_execution_plan()
+        if plan is None:
+            return None
+        for span in plan.spans:
+            if span.backend == "vulkan" and span.node_ids and span.node_ids[-1] == node_id:
+                return span
+        return None
+
     def _evaluate(
         self,
         graph: ProjectGraph,
@@ -313,6 +415,11 @@ class GraphEvaluator:
             raise GraphCycleError(f"Node graph contains a cycle: {chain}")
 
         signature = self.node_signature(graph, node_id, frame)
+        preview_target = self._current_preview_target()
+        if preview_target is not None and preview_target.node_id == node_id:
+            preview_key = preview_target.cache_key()
+            if preview_key:
+                signature = f"{signature}|preview:{preview_key}"
         cache_key = (node_id, frame, signature)
         cached = self._get_cached(cache_key)
         if cached is not None:
@@ -378,6 +485,27 @@ class GraphEvaluator:
         started = time.perf_counter()
         visiting.add(node_id)
         try:
+            vulkan_span = self._find_vulkan_span_for_node(node_id)
+            if vulkan_span is not None and self.vulkan_runtime is not None and self.vulkan_runtime.wants_vulkan():
+                try:
+                    result = self._evaluate_vulkan_span(graph, frame, visiting, resolver, vulkan_span, signature)
+                except RuntimeError as exc:
+                    self.record_phase_timing(
+                        node.id,
+                        "graph.execution_backend_fallback",
+                        0.0,
+                        {"execution_backend": "cpu", "reason": str(exc), "span_nodes": list(vulkan_span.node_ids)},
+                    )
+                else:
+                    visiting.remove(node_id)
+                    self.record_phase_timing(
+                        node.id,
+                        "graph.execution_backend",
+                        0.0,
+                        {"execution_backend": "vulkan", "span_nodes": list(vulkan_span.node_ids)},
+                    )
+                    self._store_cached(cache_key, result, signature)
+                    return result
             input_edges = graph.incoming_edges(node_id)
             if node.type.lower() == "viewer":
                 input_edges = _viewer_input_edges(graph, node_id)
@@ -414,15 +542,101 @@ class GraphEvaluator:
                 if bypass_edge is not None
                 else self._evaluate_operation(resolved_node, operation, inputs, context)
             )
-        except NodeEvaluationError:
+        except NodeEvaluationError as exc:
+            self.record_node_error(exc.node_id, graph.nodes[exc.node_id].type if exc.node_id in graph.nodes else node.type, exc.message)
             raise
         except Exception as exc:
-            raise NodeEvaluationError(node.id, str(exc)) from exc
+            wrapped = NodeEvaluationError(node.id, str(exc))
+            self.record_node_error(node.id, node.type, wrapped.message)
+            raise wrapped from exc
         finally:
             visiting.discard(node_id)
             self._end_node(node.id, node.type, started)
         if node.type.lower() != "viewer":
             self._store_cached(cache_key, result, signature)
+        return result
+
+    def _evaluate_vulkan_span(
+        self,
+        graph: ProjectGraph,
+        frame: int,
+        visiting: set[str],
+        resolver: ExpressionResolver,
+        span: ExecutionPlanSpan,
+        span_signature: str,
+    ) -> ImageFrame:
+        if self.vulkan_runtime is None:
+            raise RuntimeError("Vulkan runtime is not configured.")
+        span_nodes = [self._resolved_node(graph, node_id, frame, resolver) for node_id in span.node_ids]
+        if not span_nodes:
+            raise RuntimeError("Cannot execute an empty Vulkan span.")
+        first_node = span_nodes[0]
+        input_edges = graph.incoming_edges(first_node.id)
+        if len(input_edges) != 1:
+            raise RuntimeError(f"Vulkan v1 only supports single-input spans; '{first_node.id}' has {len(input_edges)} inputs.")
+        input_edge = input_edges[0]
+        source_image = self._evaluate(graph, input_edge.source_node, frame, set(visiting))
+        context = EvaluationContext(
+            frame=frame,
+            settings=self.settings,
+            ocio=self.ocio,
+            requested_channels=self._current_channel_demand(),
+            metrics=lambda metric_node_id, phase, duration_ms, details=None: self.record_phase_timing(
+                metric_node_id,
+                phase,
+                duration_ms,
+                details,
+            ),
+        )
+        cache_key = hashlib.sha1(
+            json.dumps(
+                {
+                    "frame": frame,
+                    "span_nodes": span.node_ids,
+                    "source_node": input_edge.source_node,
+                    "execution_backend": "vulkan",
+                    "span_signature": span_signature,
+                },
+                sort_keys=True,
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        preview_target = self._current_preview_target()
+        if preview_target is not None and preview_target.node_id == span_nodes[-1].id:
+            result, metrics = self.vulkan_runtime.execute_span(
+                graph,
+                span_nodes,
+                source_image,
+                context,
+                cache_key=cache_key,
+                preview_max_width=preview_target.max_width,
+                preview_max_height=preview_target.max_height,
+            )
+        else:
+            result, metrics = self.vulkan_runtime.execute_span(graph, span_nodes, source_image, context, cache_key=cache_key)
+        result.metadata.update(
+            {
+                "gpu/backend": metrics.execution_backend,
+                "gpu/kernel_mode": metrics.kernel_mode,
+                "gpu/upload_ms": round(metrics.gpu_upload_ms, 2),
+                "gpu/dispatch_ms": round(metrics.gpu_dispatch_ms, 2),
+                "gpu/download_ms": round(metrics.gpu_download_ms, 2),
+                "gpu/resize_ms": round(metrics.gpu_resize_ms, 2),
+                "gpu/cache_hit": metrics.gpu_cache_hit,
+                "gpu/span_nodes": list(metrics.span_nodes),
+                "gpu/simulated": metrics.simulated,
+            }
+        )
+        self.record_phase_timing(span_nodes[-1].id, "gpu.upload", metrics.gpu_upload_ms, {"simulated": metrics.simulated})
+        self.record_phase_timing(
+            span_nodes[-1].id,
+            "gpu.dispatch",
+            metrics.gpu_dispatch_ms,
+            {"simulated": metrics.simulated, "span_nodes": list(metrics.span_nodes)},
+        )
+        self.record_phase_timing(span_nodes[-1].id, "gpu.download", metrics.gpu_download_ms, {"simulated": metrics.simulated})
+        if metrics.gpu_resize_ms > 0.0:
+            self.record_phase_timing(span_nodes[-1].id, "gpu.resize", metrics.gpu_resize_ms, {"simulated": metrics.simulated})
         return result
 
     def _evaluate_operation(
@@ -511,6 +725,7 @@ class GraphEvaluator:
         if executor is None:
             return {edge.target_socket: self._evaluate(graph, edge.source_node, frame, visiting) for edge in edges}
         channel_demand = self._current_channel_demand()
+        activity_kind = self._current_activity_kind()
         for edge in edges:
             child_visiting = set(visiting)
             futures.append(
@@ -523,6 +738,7 @@ class GraphEvaluator:
                         frame,
                         child_visiting,
                         channel_demand,
+                        activity_kind,
                     ),
                 )
             )
@@ -551,16 +767,20 @@ class GraphEvaluator:
         frame: int,
         visiting: set[str],
         channel_demand: ChannelDemand | None,
+        activity_kind: Literal["foreground", "background"],
     ) -> ImageFrame:
         previous = getattr(self._thread_state, "in_worker", False)
         previous_demand = self._current_channel_demand()
+        previous_activity_kind = self._current_activity_kind()
         self._thread_state.in_worker = True
         self._thread_state.channel_demand = channel_demand
+        self._thread_state.node_activity_kind = activity_kind
         try:
             return self._evaluate(graph, node_id, frame, visiting)
         finally:
             self._thread_state.in_worker = previous
             self._set_current_channel_demand(previous_demand)
+            self._thread_state.node_activity_kind = previous_activity_kind
 
     def _evaluate_tile_cached(
         self,
@@ -705,10 +925,13 @@ class GraphEvaluator:
                 else operation.evaluate(node, inputs, context)
             )
             return _annotate_tile_frame(result, window, _tile_full_width(inputs), _tile_full_height(inputs))
-        except NodeEvaluationError:
+        except NodeEvaluationError as exc:
+            self.record_node_error(exc.node_id, graph.nodes[exc.node_id].type if exc.node_id in graph.nodes else node.type, exc.message)
             raise
         except Exception as exc:
-            raise NodeEvaluationError(node.id, str(exc)) from exc
+            wrapped = NodeEvaluationError(node.id, str(exc))
+            self.record_node_error(node.id, node.type, wrapped.message)
+            raise wrapped from exc
         finally:
             visiting.discard(node_id)
             self._end_node(node.id, node.type, started)
@@ -796,6 +1019,7 @@ class GraphEvaluator:
                 for edge in edges
             }
         channel_demand = self._current_channel_demand()
+        activity_kind = self._current_activity_kind()
         for edge in edges:
             child_visiting = set(visiting)
             futures.append(
@@ -809,6 +1033,7 @@ class GraphEvaluator:
                         window,
                         child_visiting,
                         channel_demand,
+                        activity_kind,
                     ),
                 )
             )
@@ -838,16 +1063,20 @@ class GraphEvaluator:
         window: TileWindow,
         visiting: set[str],
         channel_demand: ChannelDemand | None,
+        activity_kind: Literal["foreground", "background"],
     ) -> ImageFrame:
         previous = getattr(self._thread_state, "in_worker", False)
         previous_demand = self._current_channel_demand()
+        previous_activity_kind = self._current_activity_kind()
         self._thread_state.in_worker = True
         self._thread_state.channel_demand = channel_demand
+        self._thread_state.node_activity_kind = activity_kind
         try:
             return self._evaluate_tile_cached(graph, node_id, frame, window, visiting)
         finally:
             self._thread_state.in_worker = previous
             self._set_current_channel_demand(previous_demand)
+            self._thread_state.node_activity_kind = previous_activity_kind
 
     def _evaluate_full_tile(
         self,
@@ -937,8 +1166,27 @@ class GraphEvaluator:
             self.float_preview_cache_memory_bytes = 0
             self.tile_cache_memory_bytes = 0
             self.source_cache_memory_bytes = 0
+            self.active_nodes.clear()
+            self.active_node_counts.clear()
+            self.node_activity_counts = {"foreground": {}, "background": {}}
+            self.node_errors.clear()
             self.phase_timings.clear()
             self.request_timings.clear()
+            if self.vulkan_runtime is not None:
+                self.vulkan_runtime.clear_cache()
+
+    def clear_runtime_errors(self) -> None:
+        with self._lock:
+            self.node_errors.clear()
+
+    @contextmanager
+    def activity_scope(self, kind: Literal["foreground", "background"]) -> Iterator[None]:
+        previous = getattr(self._thread_state, "node_activity_kind", "foreground")
+        self._thread_state.node_activity_kind = kind
+        try:
+            yield
+        finally:
+            self._thread_state.node_activity_kind = previous
 
     def set_cache_limits(
         self,
@@ -1121,8 +1369,9 @@ class GraphEvaluator:
         channel: str | None,
         max_width: int | None,
         max_height: int | None,
+        roi_key: str | None = None,
     ) -> FloatPreviewCacheKey:
-        return (node_id, frame, output_signature, channel or "rgba", max_width, max_height)
+        return (node_id, frame, output_signature, channel or "rgba", max_width, max_height, roi_key)
 
     def get_cached_float_preview(self, cache_key: FloatPreviewCacheKey) -> FloatPreviewCacheEntry | None:
         if not self.settings.cache_enabled:
@@ -1218,11 +1467,18 @@ class GraphEvaluator:
                 "cached_node_frames": scoped_frames["node_frames"],
                 "cached_all_frames": all_frames["all_frames"],
                 "active_nodes": sorted(self.active_nodes),
+                "node_activity": {
+                    "foreground_active_nodes": sorted(self.node_activity_counts["foreground"].keys()),
+                    "background_active_nodes": sorted(self.node_activity_counts["background"].keys()),
+                },
                 "node_timings": dict(self.node_timings),
+                "node_errors": {node_id: dict(details) for node_id, details in self.node_errors.items()},
                 "preview_timings": dict(self.preview_timings),
                 "phase_timings": list(self.phase_timings),
                 "request_timings": list(self.request_timings),
                 "last_request_timing": self.request_timings[-1] if self.request_timings else None,
+                "ocio_runtime": self.ocio.diagnostics() if self.ocio is not None else None,
+                "gpu_runtime": self.vulkan_runtime.cache_snapshot() if self.vulkan_runtime is not None else None,
             }
 
     @contextmanager
@@ -1407,18 +1663,29 @@ class GraphEvaluator:
 
     def _begin_node(self, node_id: str) -> None:
         with self._lock:
+            activity_kind = self._current_activity_kind()
             self.active_node_counts[node_id] = self.active_node_counts.get(node_id, 0) + 1
+            bucket = self.node_activity_counts.setdefault(activity_kind, {})
+            bucket[node_id] = bucket.get(node_id, 0) + 1
             self.active_nodes.add(node_id)
 
     def _end_node(self, node_id: str, node_type: str, started: float) -> None:
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         with self._lock:
+            activity_kind = self._current_activity_kind()
             remaining = self.active_node_counts.get(node_id, 1) - 1
             if remaining <= 0:
                 self.active_node_counts.pop(node_id, None)
-                self.active_nodes.discard(node_id)
             else:
                 self.active_node_counts[node_id] = remaining
+            bucket = self.node_activity_counts.setdefault(activity_kind, {})
+            bucket_remaining = bucket.get(node_id, 1) - 1
+            if bucket_remaining <= 0:
+                bucket.pop(node_id, None)
+            else:
+                bucket[node_id] = bucket_remaining
+            if remaining <= 0:
+                self.active_nodes.discard(node_id)
             self._record_node_timing(node_id, node_type, elapsed_ms, cache_hit=False)
 
     def _record_node_timing(self, node_id: str, node_type: str, elapsed_ms: float, cache_hit: bool) -> None:
@@ -1429,6 +1696,19 @@ class GraphEvaluator:
                 "cache_hit": cache_hit,
                 "timestamp": time.time(),
             }
+            self.node_errors.pop(node_id, None)
+
+    def record_node_error(self, node_id: str, node_type: str, message: str) -> None:
+        with self._lock:
+            self.node_errors[node_id] = {
+                "type": node_type,
+                "message": message,
+                "timestamp": time.time(),
+            }
+
+    def _current_activity_kind(self) -> Literal["foreground", "background"]:
+        kind = getattr(self._thread_state, "node_activity_kind", "foreground")
+        return "background" if kind == "background" else "foreground"
 
 
 def evaluate_node(graph: ProjectGraph, node_id: str, frame: int) -> ImageFrame:

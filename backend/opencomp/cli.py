@@ -1,3 +1,10 @@
+"""Headless CLI entrypoint for project inspection, scripting, and rendering.
+
+This module exposes a scriptable command-line interface around the same project
+and evaluator core used by the app. It keeps non-UI workflows testable and
+provides a stable surface for validation, export, and batch render automation.
+"""
+
 from __future__ import annotations
 
 import argparse

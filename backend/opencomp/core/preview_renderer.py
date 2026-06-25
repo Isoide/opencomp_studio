@@ -7,8 +7,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from opencomp.core.evaluator import FloatPreviewCacheEntry, GraphEvaluator
-from opencomp.core.models import ProjectGraph, ProjectSettings
+from opencomp.core.evaluator import FloatPreviewCacheEntry, GraphEvaluator, _viewer_input_edges
+from opencomp.core.models import FrameROI, ProjectGraph, ProjectSettings
 from opencomp.io.cryptomatte import (
     build_cryptomatte_matte,
     cryptomatte_id_preview_rgba,
@@ -30,6 +30,7 @@ class PreviewRequest:
     ocio_config: str | None = None
     output_signature: str | None = None
     viewer_process: ViewerProcess | None = None
+    roi: FrameROI | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +82,13 @@ def _render_standard_preview_scoped(evaluator: GraphEvaluator, graph: ProjectGra
                 "channel": request.channel or "rgba",
                 "viewer_process": _viewer_process_payload(process),
                 "float_cache_hit": True,
+                "execution_backend": "cpu",
+                "gpu_kernel_mode": "cpu_fallback",
+                "gpu_upload_ms": 0.0,
+                "gpu_dispatch_ms": 0.0,
+                "gpu_download_ms": 0.0,
+                "gpu_resize_ms": 0.0,
+                "gpu_cache_hit": False,
                 "bytes": len(cached_preview),
             },
         )
@@ -159,6 +167,13 @@ def _render_standard_preview_scoped(evaluator: GraphEvaluator, graph: ProjectGra
             "channel": request.channel or "rgba",
             "viewer_process": _viewer_process_payload(process),
             "float_cache_hit": float_hit,
+            "execution_backend": float_preview.execution_backend,
+            "gpu_kernel_mode": float_preview.gpu_kernel_mode,
+            "gpu_upload_ms": round(float_preview.gpu_upload_ms, 2),
+            "gpu_dispatch_ms": round(float_preview.gpu_dispatch_ms, 2),
+            "gpu_download_ms": round(float_preview.gpu_download_ms, 2),
+            "gpu_resize_ms": round(float_preview.gpu_resize_ms, 2),
+            "gpu_cache_hit": float_preview.gpu_cache_hit,
             "preview_width": int(display_rgba.shape[1]),
             "preview_height": int(display_rgba.shape[0]),
             "bytes": len(png_bytes),
@@ -296,6 +311,13 @@ def _render_difference_preview_scoped(
             "compare_mode": "difference",
             "viewer_process": _viewer_process_payload(process),
             "float_cache_hit": hit_a and hit_b,
+            "execution_backend": "vulkan" if float_a.execution_backend == "vulkan" or float_b.execution_backend == "vulkan" else "cpu",
+            "gpu_kernel_mode": "native_compute" if float_a.gpu_kernel_mode == "native_compute" or float_b.gpu_kernel_mode == "native_compute" else "cpu_fallback",
+            "gpu_upload_ms": round(float_a.gpu_upload_ms + float_b.gpu_upload_ms, 2),
+            "gpu_dispatch_ms": round(float_a.gpu_dispatch_ms + float_b.gpu_dispatch_ms, 2),
+            "gpu_download_ms": round(float_a.gpu_download_ms + float_b.gpu_download_ms, 2),
+            "gpu_resize_ms": round(float_a.gpu_resize_ms + float_b.gpu_resize_ms, 2),
+            "gpu_cache_hit": float_a.gpu_cache_hit and float_b.gpu_cache_hit,
             "preview_width": int(display_rgba.shape[1]),
             "preview_height": int(display_rgba.shape[0]),
             "bytes": len(png_bytes),
@@ -319,6 +341,7 @@ def get_float_preview(
             request.channel,
             request.max_width,
             request.max_height,
+            _preview_roi_key(request.roi),
         )
         lookup_started = time.perf_counter()
         cached = evaluator.get_cached_float_preview(cache_key)
@@ -326,23 +349,40 @@ def get_float_preview(
         if cached is not None:
             return FloatPreviewResult(cached, True, lookup_ms, 0.0, 0.0)
 
+        preview_target_node_id = _preview_target_node_id(graph, request.eval_node_id)
         evaluate_started = time.perf_counter()
-        image = evaluator.evaluate_node(graph, request.eval_node_id, request.frame)
+        with evaluator.preview_target_scope(preview_target_node_id, request.max_width, request.max_height):
+            image = evaluator.evaluate_node(graph, request.eval_node_id, request.frame)
         evaluate_ms = (time.perf_counter() - evaluate_started) * 1000.0
         resize_started = time.perf_counter()
         source_rgba, apply_ocio = preview_rgba_for_channel(image, request.channel)
         preview_rgba = resize_float_rgba(source_rgba, max_width=request.max_width, max_height=request.max_height)
+        display_height = int(preview_rgba.shape[0])
+        display_width = int(preview_rgba.shape[1])
+        if request.roi is not None:
+            preview_rgba = crop_preview_rgba(preview_rgba, request.roi)
         resize_ms = (time.perf_counter() - resize_started) * 1000.0
+        source_width = int(image.metadata.get("source_width") or image.metadata.get("gpu/source_width") or image.width)
+        source_height = int(image.metadata.get("source_height") or image.metadata.get("gpu/source_height") or image.height)
         entry = FloatPreviewCacheEntry(
             rgba=np.ascontiguousarray(preview_rgba, dtype=np.float32),
             apply_ocio=apply_ocio,
             colorspace=image.colorspace,
-            source_width=image.width,
-            source_height=image.height,
+            source_width=source_width,
+            source_height=source_height,
+            display_width=display_width,
+            display_height=display_height,
             pixel_aspect=image.pixel_aspect,
             format_bbox=dict(image.format_bbox or {}),
             data_window=dict(image.data_window or {}),
             bytes=int(preview_rgba.nbytes),
+            execution_backend=str(image.metadata.get("gpu/backend") or "cpu"),
+            gpu_kernel_mode=str(image.metadata.get("gpu/kernel_mode") or "cpu_fallback"),
+            gpu_upload_ms=float(image.metadata.get("gpu/upload_ms") or 0.0),
+            gpu_dispatch_ms=float(image.metadata.get("gpu/dispatch_ms") or 0.0),
+            gpu_download_ms=float(image.metadata.get("gpu/download_ms") or 0.0),
+            gpu_resize_ms=float(image.metadata.get("gpu/resize_ms") or 0.0),
+            gpu_cache_hit=bool(image.metadata.get("gpu/cache_hit", False)),
         )
         evaluator.store_cached_float_preview(cache_key, entry)
         return FloatPreviewResult(entry, False, lookup_ms, evaluate_ms, resize_ms)
@@ -514,6 +554,8 @@ def _preview_key(
     request: PreviewRequest,
     cache_channel: str | None = None,
 ):
+    roi_suffix = _preview_roi_key(request.roi)
+    cache_channel = _preview_cache_channel(cache_channel or request.channel, roi_suffix)
     if request.output_signature is not None:
         return evaluator.preview_cache_key_for_signature(
             request.cache_node_id,
@@ -521,7 +563,7 @@ def _preview_key(
             request.output_signature,
             request.display,
             request.view,
-            cache_channel or request.channel,
+            cache_channel,
             request.max_width,
             request.max_height,
             request.ocio_config,
@@ -532,7 +574,7 @@ def _preview_key(
         request.frame,
         request.display,
         request.view,
-        cache_channel or request.channel,
+        cache_channel,
         request.max_width,
         request.max_height,
         request.ocio_config,
@@ -548,6 +590,13 @@ def _cached_timing(channel: str, byte_count: int) -> dict:
         "ocio_ms": 0.0,
         "encode_ms": 0.0,
         "channel": channel,
+        "execution_backend": "cpu",
+        "gpu_kernel_mode": "cpu_fallback",
+        "gpu_upload_ms": 0.0,
+        "gpu_dispatch_ms": 0.0,
+        "gpu_download_ms": 0.0,
+        "gpu_resize_ms": 0.0,
+        "gpu_cache_hit": False,
         "bytes": byte_count,
     }
 
@@ -582,3 +631,48 @@ def _processed_channel_key(channel: str | None, process: ViewerProcess) -> str:
 
 def _combined_signature(a: str, b: str) -> str:
     return hashlib.sha1(f"{a}|{b}".encode("utf-8")).hexdigest()
+
+
+def _preview_cache_channel(channel: str | None, roi_key: str | None) -> str:
+    base = channel or "rgba"
+    return base if not roi_key else f"{base}|roi:{roi_key}"
+
+
+def _preview_roi_key(roi: FrameROI | None) -> str | None:
+    if roi is None:
+        return None
+    width = max(0, int(roi.width))
+    height = max(0, int(roi.height))
+    if width <= 0 or height <= 0:
+        return None
+    return f"{int(roi.x)}:{int(roi.y)}:{width}:{height}"
+
+
+def _preview_target_node_id(graph: ProjectGraph, node_id: str) -> str:
+    node = graph.nodes.get(node_id)
+    if node is None or node.type.lower() != "viewer":
+        return node_id
+    edges = _viewer_input_edges(graph, node_id)
+    if not edges:
+        return node_id
+    return edges[0].source_node
+
+
+def crop_preview_rgba(rgba: np.ndarray, roi: FrameROI | None) -> np.ndarray:
+    if roi is None:
+        return rgba
+    height = int(rgba.shape[0])
+    width = int(rgba.shape[1])
+    x = clamp_int(int(roi.x), 0, width)
+    y = clamp_int(int(roi.y), 0, height)
+    max_width = max(0, width - x)
+    max_height = max(0, height - y)
+    cropped_width = min(max(0, int(roi.width)), max_width)
+    cropped_height = min(max(0, int(roi.height)), max_height)
+    if cropped_width <= 0 or cropped_height <= 0:
+        return np.zeros((1, 1, 4), dtype=np.float32)
+    return np.ascontiguousarray(rgba[y : y + cropped_height, x : x + cropped_width], dtype=np.float32)
+
+
+def clamp_int(value: int, minimum: int, maximum: int) -> int:
+    return max(minimum, min(maximum, value))

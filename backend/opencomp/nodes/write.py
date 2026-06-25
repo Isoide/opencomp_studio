@@ -36,6 +36,7 @@ class WriteNode:
                 metadata_policy=str(node.params.get("metadata", "all")),
                 channels=str(node.params.get("channels") or "rgba"),
                 create_directories=bool(node.params.get("create_directories", True)),
+                backend=context.settings.image_io_backend,
             )
         except Exception as exc:
             raise NodeEvaluationError(node.id, str(exc)) from exc

@@ -12,6 +12,8 @@ echo Backend port: %OPENCOMP_BACKEND_PORT%
 echo Frontend port: %OPENCOMP_FRONTEND_PORT%
 echo.
 
+title OpenComp Studio
+
 call "%ROOT%\install.bat" --backend-port %OPENCOMP_BACKEND_PORT% --frontend-port %OPENCOMP_FRONTEND_PORT% %*
 if errorlevel 1 (
   echo.
@@ -19,29 +21,18 @@ if errorlevel 1 (
   exit /b %ERRORLEVEL%
 )
 
-set "BACKEND_RUNNER=%ROOT%\scripts\run_backend.bat"
-set "FRONTEND_RUNNER=%ROOT%\scripts\run_frontend.bat"
+set "APP_RUNNER=%ROOT%\scripts\run_opencomp.bat"
 
-if not exist "%BACKEND_RUNNER%" (
-  echo Backend runner was not generated: "%BACKEND_RUNNER%"
-  exit /b 1
-)
-
-if not exist "%FRONTEND_RUNNER%" (
-  echo Frontend runner was not generated: "%FRONTEND_RUNNER%"
+if not exist "%APP_RUNNER%" (
+  echo App runner was not generated: "%APP_RUNNER%"
   exit /b 1
 )
 
 echo.
-echo Starting backend and frontend...
-start "OpenComp Backend" cmd /k ""%BACKEND_RUNNER%""
-start "OpenComp Frontend" cmd /k ""%FRONTEND_RUNNER%""
+echo Starting OpenComp Studio in a single console...
+call "%APP_RUNNER%"
 
 echo.
-echo OpenComp Studio is starting.
-echo Frontend: http://127.0.0.1:%OPENCOMP_FRONTEND_PORT%
-echo Backend health: http://127.0.0.1:%OPENCOMP_BACKEND_PORT%/api/health
-echo.
-echo Close the backend/frontend command windows to stop the app.
+echo OpenComp Studio stopped.
 
 exit /b 0

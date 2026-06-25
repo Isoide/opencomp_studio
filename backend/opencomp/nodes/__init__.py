@@ -37,7 +37,7 @@ NODE_DEFINITIONS = (
     NodeDefinition("Write", "Write", "I/O", WriteNode(), ("in",)),
     NodeDefinition("Constant", "Constant", "Image", ConstantNode()),
     NodeDefinition("Group", "Group", "Organization", GroupNode(), ("in",)),
-    NodeDefinition("Grade", "Grade", "Color", GradeNode(), ("in",)),
+    NodeDefinition("Grade", "Grade", "Color", GradeNode(), ("in",), execution_capability="vulkan_preferred"),
     NodeDefinition("Exposure", "Exposure", "Color", ExposureNode(), ("in",)),
     NodeDefinition("Saturation", "Saturation", "Color", SaturationNode(), ("in",)),
     NodeDefinition("Invert", "Invert", "Color", InvertNode(), ("in",)),
@@ -45,9 +45,9 @@ NODE_DEFINITIONS = (
     NodeDefinition("Colorspace", "Colorspace", "Color", ColorspaceNode(), ("in",)),
     NodeDefinition("Blur", "Blur", "Filter", BlurNode(), ("in",)),
     NodeDefinition("Crop", "Crop", "Transform", CropNode(), ("in",)),
-    NodeDefinition("Reformat", "Reformat", "Transform", ReformatNode(), ("in",)),
-    NodeDefinition("Scale", "Scale", "Transform", ScaleNode(), ("in",)),
-    NodeDefinition("Transform", "Transform", "Transform", TransformNode(), ("in",)),
+    NodeDefinition("Reformat", "Reformat", "Transform", ReformatNode(), ("in",), execution_capability="vulkan_supported"),
+    NodeDefinition("Scale", "Scale", "Transform", ScaleNode(), ("in",), execution_capability="vulkan_supported"),
+    NodeDefinition("Transform", "Transform", "Transform", TransformNode(), ("in",), execution_capability="vulkan_supported"),
     NodeDefinition("FrameHold", "FrameHold", "Transform", FrameHoldNode(), ("in",)),
     NodeDefinition("FrameRange", "FrameRange", "Transform", FrameRangeNode(), ("in",)),
     NodeDefinition("Retime", "Retime", "Transform", RetimeNode(), ("in",)),
@@ -59,7 +59,7 @@ NODE_DEFINITIONS = (
     NodeDefinition("Premult", "Premult", "Channel", PremultNode(), ("in",)),
     NodeDefinition("Unpremult", "Unpremult", "Channel", UnpremultNode(), ("in",)),
     NodeDefinition("Cryptomatte", "Cryptomatte", "Keyer", CryptomatteNode(), ("in",)),
-    NodeDefinition("ColorCorrect", "ColorCorrect", "Color", ColorCorrectNode(), ("in",)),
+    NodeDefinition("ColorCorrect", "ColorCorrect", "Color", ColorCorrectNode(), ("in",), execution_capability="vulkan_preferred"),
     NodeDefinition("HueCorrect", "HueCorrect", "Color", HueCorrectNode(), ("in",)),
     NodeDefinition("ViewMetadata", "ViewMetaData", "Metadata", ViewMetadataNode(), ("in",)),
     NodeDefinition("CompareMetadata", "CompareMetaData", "Metadata", CompareMetadataNode(), ("a", "b")),
@@ -71,5 +71,6 @@ NODE_DEFINITIONS = (
 )
 
 NODE_REGISTRY = {definition.type.lower(): definition.operation for definition in NODE_DEFINITIONS}
+NODE_DEFINITION_REGISTRY = {definition.type.lower(): definition for definition in NODE_DEFINITIONS}
 
-__all__ = ["NODE_DEFINITIONS", "NODE_REGISTRY"]
+__all__ = ["NODE_DEFINITIONS", "NODE_REGISTRY", "NODE_DEFINITION_REGISTRY"]

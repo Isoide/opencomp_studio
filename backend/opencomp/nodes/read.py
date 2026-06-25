@@ -1,14 +1,21 @@
+"""Read-node evaluation and frame remapping helpers for image sources.
+
+This module maps timeline frames to source frames, derives channel demand, and
+loads source images through the shared IO layer. Missing-frame policy and
+nearest-frame probing stay here so higher-level graph code remains generic.
+"""
+
 from __future__ import annotations
 
 import re
 import time
-from pathlib import Path
 
 import numpy as np
 
 from opencomp.core.channel_demand import BASE_READ_CHANNELS, ChannelDemand
 from opencomp.core.models import ImageFrame, Node
 from opencomp.io.image_reader import read_image
+from opencomp.io.path_utils import path_exists
 from opencomp.nodes.base import EvaluationContext, NodeEvaluationError
 
 
@@ -28,7 +35,7 @@ class ReadNode:
             return _black_frame(node, context)
         try:
             started = time.perf_counter()
-            image = read_image(path, frame=read_frame, colorspace=colorspace, read_channels=read_channels)
+            image = _read_source_image(path, read_frame, colorspace, read_channels, context.settings.image_io_backend)
             context.record_metric(
                 node.id,
                 "read.image",
@@ -54,7 +61,7 @@ class ReadNode:
                 if nearest is not None:
                     try:
                         started = time.perf_counter()
-                        image = read_image(path, frame=nearest, colorspace=colorspace, read_channels=read_channels)
+                        image = _read_source_image(path, nearest, colorspace, read_channels, context.settings.image_io_backend)
                         context.record_metric(
                             node.id,
                             "read.image",
@@ -75,6 +82,32 @@ class ReadNode:
                     except Exception:
                         pass
             raise NodeEvaluationError(node.id, str(exc)) from exc
+
+
+def _read_source_image(
+    path: str,
+    frame: int | None,
+    colorspace: str,
+    read_channels: list[str] | None,
+    backend: str,
+) -> ImageFrame:
+    try:
+        return read_image(
+            path,
+            frame=frame,
+            colorspace=colorspace,
+            read_channels=read_channels,
+            backend=backend,
+        )
+    except TypeError as exc:
+        if "unexpected keyword argument 'backend'" not in str(exc):
+            raise
+        return read_image(
+            path,
+            frame=frame,
+            colorspace=colorspace,
+            read_channels=read_channels,
+        )
 
 
 def _mapped_frame(node: Node, frame: int) -> int:
@@ -209,17 +242,7 @@ def _nearest_existing_frame(path: str, frame: int, node: Node) -> int | None:
 
 
 def _resolved_exists(path: str, frame: int) -> bool:
-    if path.startswith("builtin://"):
-        return True
-    resolved = path.replace("####", f"{frame:04d}")
-    if "%04d" in resolved:
-        resolved = resolved % frame
-    elif "%d" in resolved:
-        resolved = resolved % frame
-    try:
-        return Path(resolved).exists()
-    except OSError:
-        return False
+    return path_exists(path, frame)
 
 
 def _optional_int(value: object) -> int | None:

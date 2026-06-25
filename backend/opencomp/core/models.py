@@ -1,3 +1,10 @@
+"""Core Pydantic and dataclass models shared across the OpenComp backend.
+
+This module defines the serialized project graph structures and the in-memory
+image frame primitives passed between nodes. It stays intentionally compact so
+API routes, evaluators, IO helpers, and tests all share one consistent schema.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -75,6 +82,10 @@ class ProjectSettings(BaseModel):
     render_workers: int = 4
     read_workers: int = 4
     viewer_tile_lanes: int = 3
+    execution_backend: Literal["auto", "cpu", "vulkan"] = "auto"
+    image_io_backend: Literal["auto", "openexr", "oiio"] = "auto"
+    gpu_memory_limit_mb: int = 2048
+    gpu_warm_neighbor_frames: int = 2
 
 
 class HotkeyPreferences(BaseModel):
@@ -114,6 +125,7 @@ class ScriptTab(BaseModel):
     id: str
     name: str
     graph: ProjectGraph = Field(default_factory=ProjectGraph)
+    code: str = ""
     path: str | None = None
     startup_scripts: list[str] = Field(default_factory=list)
     kind: str = "comp"

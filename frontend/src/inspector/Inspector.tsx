@@ -1,8 +1,11 @@
 import type { CacheStatus, ColorConfig, NodeMetadata, NodeModel, NodeTiming, ProjectGraph, ProjectSettings, RequestTiming } from "../api/client";
+import { viewerResolutionLabel } from "../projectSettings";
 import type { LogEntry } from "../store/appStore";
+import { nodeMetadataDisplayViewLabel, nodeMetadataResolutionLabel, nodeMetadataSummary } from "../viewer/viewerMetadata";
 import type { WebglViewerMetrics } from "../viewer/webglFloatViewer";
 
 export type InspectorTab = "node" | "root" | "metrics" | "log";
+type ViewerProfilePreset = "speed" | "quality" | "custom";
 
 type Props = {
   node: NodeModel | null;
@@ -17,9 +20,11 @@ type Props = {
   frontendRequestTimings: RequestTiming[];
   viewerGpuMetrics: WebglViewerMetrics | null;
   activeTab: InspectorTab;
+  viewerProfilePreset: ViewerProfilePreset;
   onTabChange: (tab: InspectorTab) => void;
   onChange: (node: NodeModel) => void;
   onSettingsChange: (settings: Partial<ProjectSettings>, affectsRender?: boolean) => void;
+  onApplyViewerProfile: (profile: Exclude<ViewerProfilePreset, "custom">) => void;
   onRenderWrite: () => void;
 };
 
@@ -36,9 +41,11 @@ export function Inspector({
   frontendRequestTimings,
   viewerGpuMetrics,
   activeTab,
+  viewerProfilePreset,
   onTabChange,
   onChange,
   onSettingsChange,
+  onApplyViewerProfile,
   onRenderWrite,
 }: Props) {
   return (
@@ -65,7 +72,13 @@ export function Inspector({
           <div className="empty-copy">Select a node</div>
         ))}
       {activeTab === "root" && (
-        <RootSettings settings={settings} colorConfig={colorConfig} onSettingsChange={onSettingsChange} />
+        <RootSettings
+          settings={settings}
+          colorConfig={colorConfig}
+          viewerProfilePreset={viewerProfilePreset}
+          onSettingsChange={onSettingsChange}
+          onApplyViewerProfile={onApplyViewerProfile}
+        />
       )}
       {activeTab === "metrics" && (
         <MetricsInspector
@@ -123,10 +136,17 @@ function NodeInspector({
       )}
       {metadata && (
         <details className="metadata-view" open={node.type.toLowerCase() === "read"}>
-          <summary>
-            Metadata | {metadata.width}x{metadata.height}
-            {metadata.pixel_aspect !== 1 ? ` | PA ${metadata.pixel_aspect}` : ""} | {metadata.colorspace}
-          </summary>
+          <summary>{`Metadata | ${nodeMetadataSummary(metadata)}`}</summary>
+          <div className="metadata-table">
+            <div>
+              <span>viewer</span>
+              <code>{nodeMetadataResolutionLabel(metadata)}</code>
+            </div>
+            <div>
+              <span>display/view</span>
+              <code>{nodeMetadataDisplayViewLabel(metadata)}</code>
+            </div>
+          </div>
           <div className="channel-list">
             {metadata.channels.map((channel) => (
               <span key={channel}>{channel}</span>
@@ -165,46 +185,57 @@ function NodeInspector({
 function RootSettings({
   settings,
   colorConfig,
+  viewerProfilePreset,
   onSettingsChange,
+  onApplyViewerProfile,
 }: {
   settings: ProjectSettings | null;
   colorConfig: ColorConfig | null;
+  viewerProfilePreset: ViewerProfilePreset;
   onSettingsChange: (settings: Partial<ProjectSettings>, affectsRender?: boolean) => void;
+  onApplyViewerProfile: (profile: Exclude<ViewerProfilePreset, "custom">) => void;
 }) {
-  if (!settings) return <div className="empty-copy">No project settings loaded</div>;
+  if (!settings) return <div className="empty-copy">No project loaded.</div>;
   return (
     <div className="root-settings">
+      <div className="preset-controls">
+        <button className={viewerProfilePreset === "speed" ? "active" : ""} onClick={() => onApplyViewerProfile("speed")}>
+          Speed
+        </button>
+        <button className={viewerProfilePreset === "quality" ? "active" : ""} onClick={() => onApplyViewerProfile("quality")}>
+          Quality
+        </button>
+        <span>
+          {viewerProfilePreset === "custom"
+            ? `Custom viewer settings | ${viewerResolutionLabel(settings)}`
+            : viewerProfilePreset === "speed"
+              ? "1280x720 proxy preset"
+              : "Full-resolution preset"}
+        </span>
+      </div>
       <label>
-        Start
-        <input
-          type="number"
-          value={settings.frame_start}
-          onChange={(event) => onSettingsChange({ frame_start: Number(event.target.value) })}
-        />
+        Frame Start
+        <input type="number" value={settings.frame_start} onChange={(event) => onSettingsChange({ frame_start: Number(event.target.value) })} />
       </label>
       <label>
-        End
-        <input
-          type="number"
-          value={settings.frame_end}
-          onChange={(event) => onSettingsChange({ frame_end: Number(event.target.value) })}
-        />
+        Frame End
+        <input type="number" value={settings.frame_end} onChange={(event) => onSettingsChange({ frame_end: Number(event.target.value) })} />
       </label>
       <label>
         FPS
-        <input
-          type="number"
-          value={settings.fps}
-          step="0.01"
-          onChange={(event) => onSettingsChange({ fps: Number(event.target.value) }, false)}
-        />
+        <input type="number" step="0.01" value={settings.fps} onChange={(event) => onSettingsChange({ fps: Number(event.target.value) })} />
       </label>
       <label>
-        Working
-        <select
-          value={settings.working_colorspace}
-          onChange={(event) => onSettingsChange({ working_colorspace: event.target.value })}
-        >
+        Width
+        <input type="number" value={settings.width} onChange={(event) => onSettingsChange({ width: Number(event.target.value) })} />
+      </label>
+      <label>
+        Height
+        <input type="number" value={settings.height} onChange={(event) => onSettingsChange({ height: Number(event.target.value) })} />
+      </label>
+      <label>
+        Working Space
+        <select value={settings.working_colorspace} onChange={(event) => onSettingsChange({ working_colorspace: event.target.value })}>
           {(colorConfig?.colorspaces ?? [settings.working_colorspace]).map((colorspace) => (
             <option key={colorspace} value={colorspace}>
               {colorspace}
@@ -213,11 +244,33 @@ function RootSettings({
         </select>
       </label>
       <label>
-        OCIO
+        Viewer Display
+        <select value={settings.viewer_display ?? ""} onChange={(event) => onSettingsChange({ viewer_display: event.target.value || null, viewer_view: null }, false)}>
+          <option value="">Default</option>
+          {(colorConfig?.displays ?? []).map((display) => (
+            <option key={display} value={display}>
+              {display}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label>
+        Viewer View
+        <select value={settings.viewer_view ?? ""} onChange={(event) => onSettingsChange({ viewer_view: event.target.value || null }, false)}>
+          <option value="">Default</option>
+          {(colorConfig?.views ?? []).map((view) => (
+            <option key={view} value={view}>
+              {view}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label>
+        OCIO Config
         <input
           list="ocio-configs"
           value={settings.ocio_config ?? ""}
-          onChange={(event) => onSettingsChange({ ocio_config: event.target.value || null })}
+          onChange={(event) => onSettingsChange({ ocio_config: event.target.value || null }, false)}
           placeholder="auto, builtin, or .ocio"
         />
         <datalist id="ocio-configs">
@@ -238,108 +291,51 @@ function RootSettings({
       </label>
       <label>
         Output
-        <input
-          value={settings.default_output_path}
-          onChange={(event) => onSettingsChange({ default_output_path: event.target.value }, false)}
-        />
+        <input value={settings.default_output_path} onChange={(event) => onSettingsChange({ default_output_path: event.target.value }, false)} />
       </label>
       <label className="toggle-label">
-        <input
-          type="checkbox"
-          checked={settings.proxy_enabled}
-          onChange={(event) => onSettingsChange({ proxy_enabled: event.target.checked })}
-        />
+        <input type="checkbox" checked={settings.proxy_enabled} onChange={(event) => onSettingsChange({ proxy_enabled: event.target.checked })} />
         Proxy
       </label>
       <label>
         Proxy W
-        <input
-          type="number"
-          value={settings.viewer_max_width}
-          disabled={!settings.proxy_enabled}
-          onChange={(event) => onSettingsChange({ viewer_max_width: Number(event.target.value) })}
-        />
+        <input type="number" min={1} value={settings.viewer_max_width} disabled={!settings.proxy_enabled} onChange={(event) => onSettingsChange({ viewer_max_width: Number(event.target.value) })} />
       </label>
       <label>
         Proxy H
-        <input
-          type="number"
-          value={settings.viewer_max_height}
-          disabled={!settings.proxy_enabled}
-          onChange={(event) => onSettingsChange({ viewer_max_height: Number(event.target.value) })}
-        />
+        <input type="number" min={1} value={settings.viewer_max_height} disabled={!settings.proxy_enabled} onChange={(event) => onSettingsChange({ viewer_max_height: Number(event.target.value) })} />
       </label>
       <label className="toggle-label">
-        <input
-          type="checkbox"
-          checked={settings.cache_enabled}
-          onChange={(event) => onSettingsChange({ cache_enabled: event.target.checked })}
-        />
+        <input type="checkbox" checked={settings.cache_enabled} onChange={(event) => onSettingsChange({ cache_enabled: event.target.checked })} />
         Cache
       </label>
       <label className="toggle-label">
-        <input
-          type="checkbox"
-          checked={settings.auto_refresh}
-          onChange={(event) => onSettingsChange({ auto_refresh: event.target.checked }, false)}
-        />
+        <input type="checkbox" checked={settings.auto_refresh} onChange={(event) => onSettingsChange({ auto_refresh: event.target.checked }, false)} />
         Auto
       </label>
       <label className="toggle-label">
-        <input
-          type="checkbox"
-          checked={settings.tile_rendering_enabled}
-          onChange={(event) => onSettingsChange({ tile_rendering_enabled: event.target.checked })}
-        />
+        <input type="checkbox" checked={settings.tile_rendering_enabled} onChange={(event) => onSettingsChange({ tile_rendering_enabled: event.target.checked })} />
         Tiles
       </label>
       <label>
         Tile H
-        <input
-          type="number"
-          value={settings.tile_height}
-          min={1}
-          disabled={!settings.tile_rendering_enabled}
-          onChange={(event) => onSettingsChange({ tile_height: Number(event.target.value) })}
-        />
+        <input type="number" min={1} value={settings.tile_height} disabled={!settings.tile_rendering_enabled} onChange={(event) => onSettingsChange({ tile_height: Number(event.target.value) })} />
       </label>
       <label>
         Tile Workers
-        <input
-          type="number"
-          value={settings.tile_workers}
-          min={1}
-          disabled={!settings.tile_rendering_enabled}
-          onChange={(event) => onSettingsChange({ tile_workers: Number(event.target.value) })}
-        />
+        <input type="number" min={1} value={settings.tile_workers} disabled={!settings.tile_rendering_enabled} onChange={(event) => onSettingsChange({ tile_workers: Number(event.target.value) })} />
       </label>
       <label>
         Render Workers
-        <input
-          type="number"
-          value={settings.render_workers}
-          min={1}
-          onChange={(event) => onSettingsChange({ render_workers: Number(event.target.value) })}
-        />
+        <input type="number" min={1} value={settings.render_workers} onChange={(event) => onSettingsChange({ render_workers: Number(event.target.value) })} />
       </label>
       <label>
         Read Workers
-        <input
-          type="number"
-          value={settings.read_workers}
-          min={1}
-          onChange={(event) => onSettingsChange({ read_workers: Number(event.target.value) })}
-        />
+        <input type="number" min={1} value={settings.read_workers} onChange={(event) => onSettingsChange({ read_workers: Number(event.target.value) })} />
       </label>
       <label>
-        Transfer Lanes
-        <input
-          type="number"
-          value={settings.viewer_tile_lanes}
-          min={1}
-          max={8}
-          onChange={(event) => onSettingsChange({ viewer_tile_lanes: Number(event.target.value) }, false)}
-        />
+        Viewer Tile Lanes
+        <input type="number" min={1} max={8} value={settings.viewer_tile_lanes} onChange={(event) => onSettingsChange({ viewer_tile_lanes: Number(event.target.value) })} />
       </label>
     </div>
   );

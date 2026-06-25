@@ -59,12 +59,17 @@ export type ProjectSettings = {
   render_workers: number;
   read_workers: number;
   viewer_tile_lanes: number;
+  execution_backend: "auto" | "cpu" | "vulkan";
+  image_io_backend: "auto" | "openexr" | "oiio";
+  gpu_memory_limit_mb: number;
+  gpu_warm_neighbor_frames: number;
 };
 
 export type ScriptTab = {
   id: string;
   name: string;
   graph: ProjectGraph;
+  code: string;
   path: string | null;
   startup_scripts: string[];
   kind: string;
@@ -165,6 +170,18 @@ export type NodeMetadata = {
   resolved_params: Record<string, unknown>;
   expression_errors: Record<string, string>;
   bindable_outputs: Record<string, unknown>;
+  viewer_context: {
+    display: string | null;
+    view: string | null;
+    proxy_enabled: boolean;
+    proxy_width: number | null;
+    proxy_height: number | null;
+    requested_width: number;
+    requested_height: number;
+    render_width: number;
+    render_height: number;
+    resolution_label: string;
+  };
 };
 
 export type BBox = {
@@ -229,6 +246,7 @@ export type PreviewTiming = {
   timestamp: number;
   channel?: string;
   float_cache_hit?: boolean;
+  gpu_resize_ms?: number;
 };
 
 export type PhaseTiming = {
@@ -266,6 +284,12 @@ export type RequestTiming = {
   tile_count?: number;
   tile_count_total?: number;
   transfer_mode?: string;
+  execution_backend?: "cpu" | "vulkan";
+  gpu_kernel_mode?: "cpu_fallback" | "native_compute";
+  gpu_upload_ms?: number;
+  gpu_dispatch_ms?: number;
+  gpu_download_ms?: number;
+  gpu_cache_hit?: boolean;
   ws_wait_ms?: number;
   receive_ms?: number;
   tile_copy_ms?: number;
@@ -299,6 +323,12 @@ export type FloatViewerFrameHeader = {
   evaluate_ms: number;
   node_eval_ms?: number;
   resize_ms: number;
+  execution_backend?: "cpu" | "vulkan";
+  gpu_kernel_mode?: "cpu_fallback" | "native_compute";
+  gpu_upload_ms?: number;
+  gpu_dispatch_ms?: number;
+  gpu_download_ms?: number;
+  gpu_cache_hit?: boolean;
   tile_stream?: boolean;
   tile_width?: number | null;
   tile_height?: number | null;
@@ -385,11 +415,32 @@ export type CacheStatus = {
   cached_node_frames: number[];
   cached_all_frames: number[];
   active_nodes: string[];
+  node_activity?: {
+    foreground_active_nodes: string[];
+    background_active_nodes: string[];
+  };
   node_timings: Record<string, NodeTiming>;
+  node_errors: Record<string, { type: string; message: string; timestamp: number }>;
   preview_timings: Record<string, PreviewTiming>;
   phase_timings: PhaseTiming[];
   request_timings: RequestTiming[];
   last_request_timing: RequestTiming | null;
+  gpu_runtime?: {
+    enabled: boolean;
+    available: boolean;
+    bindings_available: boolean;
+    simulated: boolean;
+    native_execution_ready?: boolean;
+    native_kernels_bound?: boolean;
+    initialization_error: string | null;
+    entries: number;
+    memory_bytes: number;
+    hits: number;
+    misses: number;
+    supported_node_types: string[];
+    native_context?: Record<string, unknown> | null;
+    shader_toolchain?: Record<string, unknown> | null;
+  } | null;
 };
 
 export type ViewerFrameOptions = {
@@ -434,14 +485,79 @@ function createRequestId(): string {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
 
+export class ApiError extends Error {
+  status: number | null;
+  nodeId: string | null;
+  kind: string | null;
+  payload: unknown;
+
+  constructor(
+    message: string,
+    options: {
+      status?: number | null;
+      nodeId?: string | null;
+      kind?: string | null;
+      payload?: unknown;
+    } = {},
+  ) {
+    super(message);
+    this.name = "ApiError";
+    this.status = options.status ?? null;
+    this.nodeId = options.nodeId ?? null;
+    this.kind = options.kind ?? null;
+    this.payload = options.payload ?? null;
+  }
+}
+
+export function isApiError(error: unknown): error is ApiError {
+  return error instanceof ApiError;
+}
+
+function apiErrorFromPayload(payload: unknown, status: number | null, fallbackMessage: string): ApiError {
+  const detail =
+    payload && typeof payload === "object" && "detail" in payload ? (payload as { detail?: unknown }).detail : payload;
+  if (typeof detail === "string") {
+    return new ApiError(detail, { status, payload });
+  }
+  if (detail && typeof detail === "object") {
+    const data = detail as { detail?: unknown; message?: unknown; node_id?: unknown; kind?: unknown };
+    const message =
+      typeof data.detail === "string"
+        ? data.detail
+        : typeof data.message === "string"
+          ? data.message
+          : fallbackMessage;
+    return new ApiError(message, {
+      status,
+      nodeId: typeof data.node_id === "string" ? data.node_id : null,
+      kind: typeof data.kind === "string" ? data.kind : null,
+      payload,
+    });
+  }
+  return new ApiError(fallbackMessage, { status, payload });
+}
+
+async function throwResponseError(response: Response): Promise<never> {
+  const fallbackMessage = `${response.status} ${response.statusText}`;
+  const text = await response.text();
+  if (!text) {
+    throw new ApiError(fallbackMessage, { status: response.status });
+  }
+  try {
+    throw apiErrorFromPayload(JSON.parse(text), response.status, fallbackMessage);
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    throw new ApiError(text, { status: response.status });
+  }
+}
+
 async function jsonRequest<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
     headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) },
     ...init,
   });
   if (!response.ok) {
-    const text = await response.text();
-    throw new Error(text || `${response.status} ${response.statusText}`);
+    await throwResponseError(response);
   }
   return response.json() as Promise<T>;
 }
@@ -530,7 +646,7 @@ function websocketTextError(message: string): Error {
       return new DOMException("The request was cancelled by a newer viewer request.", "AbortError");
     }
     if (parsed.type === "error") {
-      return new Error(parsed.detail ?? message);
+      return apiErrorFromPayload(parsed, null, typeof parsed.detail === "string" ? parsed.detail : message);
     }
   } catch {
     // Fall through to the raw text error.
@@ -662,57 +778,63 @@ function websocketFloatFrame(
     socket.onmessage = (event) => {
       markMessage();
       if (typeof event.data === "string") {
-        const parsed = JSON.parse(event.data);
-        if (parsed.type === "error") {
-          finish(() => {
-            reject(new Error(parsed.detail ?? event.data));
-          });
-          return;
-        }
-        if (parsed.type === "viewer_request_cancelled") {
-          finish(() => {
-            socket.close();
-            reject(new DOMException("The request was cancelled by a newer viewer request.", "AbortError"));
-          });
-          return;
-        }
-        if (parsed.type === "viewer_float_tile") {
-          tileHeader = parsed as FloatViewerTileHeader;
-          return;
-        }
-        if (parsed.type === "viewer_float_tiles_done") {
-          if (!header || !tiledPixels) {
+        try {
+          const parsed = JSON.parse(event.data);
+          if (parsed.type === "error") {
             finish(() => {
-              socket.close();
-              reject(new Error("Float tile stream finished before frame allocation."));
+              reject(apiErrorFromPayload(parsed, null, typeof parsed.detail === "string" ? parsed.detail : event.data));
             });
             return;
           }
-          const expectedTiles = header.tile_count ?? tilesReceived;
-          if (tilesReceived !== expectedTiles) {
+          if (parsed.type === "viewer_request_cancelled") {
             finish(() => {
               socket.close();
-              reject(new Error(`Float tile stream ended after ${tilesReceived}/${expectedTiles} tiles.`));
+              reject(new DOMException("The request was cancelled by a newer viewer request.", "AbortError"));
             });
             return;
           }
-          const resolvedHeader = {
-            ...header,
-            partial: false,
-            tiles_received: tilesReceived,
-            tile_revision: tilesReceived + 1,
-            updated_tile: null,
-          };
-          const resolvedPixels = tiledPixels;
+          if (parsed.type === "viewer_float_tile") {
+            tileHeader = parsed as FloatViewerTileHeader;
+            return;
+          }
+          if (parsed.type === "viewer_float_tiles_done") {
+            if (!header || !tiledPixels) {
+              finish(() => {
+                socket.close();
+                reject(new Error("Float tile stream finished before frame allocation."));
+              });
+              return;
+            }
+            const expectedTiles = header.tile_count ?? tilesReceived;
+            if (tilesReceived !== expectedTiles) {
+              finish(() => {
+                socket.close();
+                reject(new Error(`Float tile stream ended after ${tilesReceived}/${expectedTiles} tiles.`));
+              });
+              return;
+            }
+            const resolvedHeader = {
+              ...header,
+              partial: false,
+              tiles_received: tilesReceived,
+              tile_revision: tilesReceived + 1,
+              updated_tile: null,
+            };
+            const resolvedPixels = tiledPixels;
+            finish(() => {
+              resolve({ header: resolvedHeader, pixels: resolvedPixels, metrics: metrics() });
+            });
+            return;
+          }
+          header = parsed as FloatViewerFrameHeader;
+          if (header.tile_stream) {
+            tiledPixels = allocateFloatPixels(header);
+            tilesReceived = 0;
+          }
+        } catch {
           finish(() => {
-            resolve({ header: resolvedHeader, pixels: resolvedPixels, metrics: metrics() });
+            reject(new Error(event.data));
           });
-          return;
-        }
-        header = parsed as FloatViewerFrameHeader;
-        if (header.tile_stream) {
-          tiledPixels = allocateFloatPixels(header);
-          tilesReceived = 0;
         }
         return;
       }
@@ -901,42 +1023,49 @@ function websocketFloatFrameLanes(
       socket.onmessage = (event) => {
         markMessage();
         if (typeof event.data === "string") {
-          const parsed = JSON.parse(event.data);
-          if (parsed.type === "error") {
+          try {
+            const parsed = JSON.parse(event.data);
+            if (parsed.type === "error") {
+              finish(() => {
+                closeSockets();
+                reject(apiErrorFromPayload(parsed, null, typeof parsed.detail === "string" ? parsed.detail : event.data));
+              });
+              return;
+            }
+            if (parsed.type === "viewer_request_cancelled") {
+              finish(() => {
+                closeSockets();
+                reject(new DOMException("The request was cancelled by a newer viewer request.", "AbortError"));
+              });
+              return;
+            }
+            if (parsed.type === "viewer_float_tile") {
+              tileHeader = parsed as FloatViewerTileHeader;
+              return;
+            }
+            if (parsed.type === "viewer_float_tiles_done") {
+              laneClosed = true;
+              completedLanes += 1;
+              maybeResolve();
+              return;
+            }
+            const nextHeader = parsed as FloatViewerFrameHeader;
+            if (!header) {
+              expectedTiles = nextHeader.tile_count_total ?? nextHeader.tile_count ?? 0;
+              header = {
+                ...nextHeader,
+                tile_count: expectedTiles,
+                tile_count_total: expectedTiles,
+                tile_lanes: resolvedLaneCount,
+                tile_lane: null,
+              };
+              pixels = allocateFloatPixels(header);
+            }
+          } catch {
             finish(() => {
               closeSockets();
-              reject(new Error(parsed.detail ?? event.data));
+              reject(new Error(event.data));
             });
-            return;
-          }
-          if (parsed.type === "viewer_request_cancelled") {
-            finish(() => {
-              closeSockets();
-              reject(new DOMException("The request was cancelled by a newer viewer request.", "AbortError"));
-            });
-            return;
-          }
-          if (parsed.type === "viewer_float_tile") {
-            tileHeader = parsed as FloatViewerTileHeader;
-            return;
-          }
-          if (parsed.type === "viewer_float_tiles_done") {
-            laneClosed = true;
-            completedLanes += 1;
-            maybeResolve();
-            return;
-          }
-          const nextHeader = parsed as FloatViewerFrameHeader;
-          if (!header) {
-            expectedTiles = nextHeader.tile_count_total ?? nextHeader.tile_count ?? 0;
-            header = {
-              ...nextHeader,
-              tile_count: expectedTiles,
-              tile_count_total: expectedTiles,
-              tile_lanes: resolvedLaneCount,
-              tile_lane: null,
-            };
-            pixels = allocateFloatPixels(header);
           }
           return;
         }
@@ -1019,6 +1148,7 @@ function isAbortError(error: unknown): boolean {
 
 export const client = {
   health: () => jsonRequest<{ status: string; app: string }>("/api/health"),
+  currentProject: () => jsonRequest<Project>("/api/projects/current"),
   newProject: () => jsonRequest<Project>("/api/projects/new", { method: "POST", body: "{}" }),
   saveProject: (path: string | null, project: Project) =>
     jsonRequest<Project>("/api/projects/save", {
@@ -1047,7 +1177,7 @@ export const client = {
       body: JSON.stringify({ path, project }),
     });
     if (!response.ok) {
-      throw new Error(await response.text());
+      await throwResponseError(response);
     }
     return response.blob();
   },
@@ -1161,8 +1291,7 @@ export const client = {
       signal,
     });
     if (!response.ok) {
-      const text = await response.text();
-      throw new Error(text || `${response.status} ${response.statusText}`);
+      await throwResponseError(response);
     }
     return response.blob();
   },
@@ -1182,8 +1311,7 @@ export const client = {
       signal,
     });
     if (!response.ok) {
-      const text = await response.text();
-      throw new Error(text || `${response.status} ${response.statusText}`);
+      await throwResponseError(response);
     }
     return response.blob();
   },
@@ -1209,7 +1337,7 @@ export const client = {
       viewerFrameWebSocketSupported = true;
       return blob;
     } catch (error) {
-      if (!isAbortError(error)) {
+      if (!isAbortError(error) && !isApiError(error)) {
         viewerFrameWebSocketSupported = false;
       }
       throw error;

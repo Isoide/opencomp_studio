@@ -1,23 +1,20 @@
+"""OpenColorIO and OpenImageIO-backed color transforms for OpenComp.
+
+This engine loads the active OCIO config, exposes viewer-facing config metadata,
+and runs CPU or OIIO-assisted color transforms for graph evaluation and viewer
+display conversion. Optional integrations stay observable through diagnostics.
+"""
+
 from __future__ import annotations
 
+import tempfile
 from dataclasses import dataclass, field
-from typing import Any
+from pathlib import Path
+from typing import Any, Callable
 
 import numpy as np
 
-
-def _import_ocio() -> Any | None:
-    try:
-        import PyOpenColorIO as ocio  # type: ignore
-
-        return ocio
-    except ImportError:
-        try:
-            import opencolorio as ocio  # type: ignore
-
-            return ocio
-        except ImportError:
-            return None
+from opencomp.core.optional_dependencies import import_first_available, import_optional
 
 
 class OCIOUnavailableError(RuntimeError):
@@ -28,18 +25,53 @@ class OCIOUnavailableError(RuntimeError):
 class OCIOColorEngine:
     config_path_or_builtin: str | None = None
     _ocio: Any | None = field(default=None, init=False, repr=False)
+    _oiio: Any | None = field(default=None, init=False, repr=False)
+    _ocio_module_name: str | None = field(default=None, init=False, repr=False)
+    _oiio_module_name: str | None = field(default=None, init=False, repr=False)
     _config: Any | None = field(default=None, init=False, repr=False)
     _processor_cache: dict[tuple[str, ...], Any] = field(default_factory=dict, init=False, repr=False)
+    _oiio_config_path: str | None = field(default=None, init=False, repr=False)
+    _oiio_temp_config_path: str | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
-        self._ocio = _import_ocio()
+        ocio_dependency = import_first_available("PyOpenColorIO", "opencolorio")
+        self._ocio = ocio_dependency.module
+        self._ocio_module_name = ocio_dependency.module_name
+        self._oiio = import_optional("OpenImageIO")
+        self._oiio_module_name = "OpenImageIO" if self._oiio is not None else None
         if self._ocio is None:
             return
         self._config = self._load_config(self.config_path_or_builtin)
 
+    def __del__(self) -> None:  # pragma: no cover - best-effort cleanup
+        try:
+            self.close()
+        except Exception:
+            return
+
+    def close(self) -> None:
+        if self._oiio_temp_config_path:
+            try:
+                Path(self._oiio_temp_config_path).unlink()
+            except OSError:
+                pass
+            self._oiio_temp_config_path = None
+
     @property
     def available(self) -> bool:
         return self._ocio is not None and self._config is not None
+
+    def diagnostics(self) -> dict[str, Any]:
+        return {
+            "available": self.available,
+            "ocio_available": self._ocio is not None,
+            "oiio_available": self._oiio is not None,
+            "ocio_module": self._ocio_module_name,
+            "oiio_module": self._oiio_module_name,
+            "config_loaded": self._config is not None,
+            "config_source": self.config_path_or_builtin,
+            "warning": self._diagnostics_warning(),
+        }
 
     def _load_config(self, config_path_or_builtin: str | None) -> Any:
         ocio = self._ocio
@@ -120,7 +152,11 @@ class OCIOColorEngine:
                 "OpenColorIO Python bindings are not installed; cannot convert colorspaces."
             )
         cpu = self._get_colorspace_processor(src, dst)
-        return self._apply_cpu_processor(cpu, image)
+        return self._apply_with_optional_oiio(
+            image,
+            lambda: self._apply_oiio_colorconvert(image, src, dst),
+            lambda: self._apply_cpu_processor(cpu, image),
+        )
 
     def apply_display_view(
         self,
@@ -135,7 +171,11 @@ class OCIOColorEngine:
         display_name = display or self._default_display()
         view_name = view or self._default_view(display_name)
         cpu = self._get_display_processor(src, display_name, view_name)
-        return self._apply_cpu_processor(cpu, image)
+        return self._apply_with_optional_oiio(
+            image,
+            lambda: self._apply_oiio_display(image, src, display_name, view_name),
+            lambda: self._apply_cpu_processor(cpu, image),
+        )
 
     def gpu_display_shader(
         self,
@@ -197,6 +237,111 @@ class OCIOColorEngine:
         if image.ndim != 3 or image.shape[2] != 4:
             raise ValueError("OCIO operations require an H x W x 4 float32 RGBA array.")
         return np.ascontiguousarray(image)
+
+    def _oiio_colorconfig_path(self) -> str:
+        if self._oiio_config_path:
+            return self._oiio_config_path
+        if self.config_path_or_builtin and self.config_path_or_builtin.endswith(".ocio"):
+            self._oiio_config_path = self.config_path_or_builtin
+            return self._oiio_config_path
+        if self._config is None or not hasattr(self._config, "serialize"):
+            raise RuntimeError("Current OCIO config cannot be materialized for OpenImageIO.")
+        with tempfile.NamedTemporaryFile("w", suffix=".ocio", delete=False, encoding="utf-8") as handle:
+            handle.write(self._config.serialize())
+            self._oiio_temp_config_path = handle.name
+        self._oiio_config_path = self._oiio_temp_config_path
+        return self._oiio_config_path
+
+    def _oiio_imagebuf_from_rgba(self, image: np.ndarray) -> Any:
+        oiio = self._oiio
+        if oiio is None:
+            raise RuntimeError("OpenImageIO is not available.")
+        height, width = image.shape[:2]
+        spec = oiio.ImageSpec(width, height, 4, oiio.FLOAT)
+        spec.channelnames = ("R", "G", "B", "A")
+        buf = oiio.ImageBuf(spec)
+        roi = oiio.ROI(0, width, 0, height, 0, 1, 0, 4)
+        if not buf.set_pixels(roi, np.ascontiguousarray(image, dtype=np.float32)):
+            raise RuntimeError(buf.geterror() if hasattr(buf, "geterror") else "OpenImageIO could not upload pixels.")
+        return buf
+
+    def _oiio_imagebuf_to_rgba(self, buf: Any) -> np.ndarray:
+        oiio = self._oiio
+        if oiio is None:
+            raise RuntimeError("OpenImageIO is not available.")
+        pixels = buf.get_pixels(oiio.FLOAT)
+        image = np.ascontiguousarray(np.asarray(pixels, dtype=np.float32))
+        if image.ndim != 3:
+            raise RuntimeError(f"Unexpected OpenImageIO output layout {image.shape!r}.")
+        if image.shape[2] == 4:
+            return image
+        if image.shape[2] == 3:
+            rgba = np.empty((image.shape[0], image.shape[1], 4), dtype=np.float32)
+            rgba[:, :, :3] = image
+            rgba[:, :, 3] = 1.0
+            return rgba
+        raise RuntimeError(f"Unexpected OpenImageIO channel count {image.shape[2]}.")
+
+    def _apply_oiio_colorconvert(self, image: np.ndarray, src: str, dst: str) -> np.ndarray:
+        oiio = self._oiio
+        if oiio is None:
+            raise RuntimeError("OpenImageIO is not available.")
+        buf = self._oiio_imagebuf_from_rgba(image)
+        converted = oiio.ImageBufAlgo.colorconvert(
+            buf,
+            src,
+            dst,
+            True,
+            "",
+            "",
+            self._oiio_colorconfig_path(),
+        )
+        if hasattr(converted, "has_error") and converted.has_error:
+            raise RuntimeError(converted.geterror())
+        return self._oiio_imagebuf_to_rgba(converted)
+
+    def _apply_oiio_display(self, image: np.ndarray, src: str, display: str, view: str) -> np.ndarray:
+        oiio = self._oiio
+        if oiio is None:
+            raise RuntimeError("OpenImageIO is not available.")
+        buf = self._oiio_imagebuf_from_rgba(image)
+        displayed = oiio.ImageBufAlgo.ociodisplay(
+            buf,
+            display,
+            view,
+            src,
+            "",
+            True,
+            False,
+            "",
+            "",
+            self._oiio_colorconfig_path(),
+        )
+        if hasattr(displayed, "has_error") and displayed.has_error:
+            raise RuntimeError(displayed.geterror())
+        return self._oiio_imagebuf_to_rgba(displayed)
+
+    def _apply_with_optional_oiio(
+        self,
+        image: np.ndarray,
+        oiio_transform: Callable[[], np.ndarray],
+        fallback_transform: Callable[[], np.ndarray],
+    ) -> np.ndarray:
+        if self._oiio is not None:
+            try:
+                return oiio_transform()
+            except Exception:
+                pass
+        return fallback_transform()
+
+    def _diagnostics_warning(self) -> str | None:
+        if self._ocio is None:
+            return "OpenColorIO Python bindings are unavailable. Color conversion falls back to pass-through behavior where supported."
+        if self._config is None:
+            return "OpenColorIO is installed, but no config could be loaded."
+        if self._oiio is None:
+            return "OpenImageIO is unavailable. OCIO CPU processors remain available, but OIIO-accelerated color conversions are disabled."
+        return None
 
     def _get_colorspace_processor(self, src: str, dst: str) -> Any:
         key = ("colorspace", src, dst)

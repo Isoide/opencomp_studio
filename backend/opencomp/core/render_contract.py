@@ -110,6 +110,14 @@ class ExecutionPlanNode:
     disabled: bool
     bypass_socket: str | None
     tile_native: bool
+    execution_backend: str = "cpu"
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionPlanSpan:
+    backend: str
+    node_ids: tuple[str, ...]
+    tile_native: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,11 +130,13 @@ class ExecutionPlan:
     fallback_nodes: tuple[str, ...]
     tile_native: bool
     nodes: tuple[ExecutionPlanNode, ...]
+    spans: tuple[ExecutionPlanSpan, ...]
     cache_key: str
     build_ms: float
     cache_hit: bool = False
 
     def as_metrics(self) -> dict[str, object]:
+        vulkan_spans = sum(1 for span in self.spans if span.backend == "vulkan")
         return {
             "request_id": self.request.request_id,
             "eval_node_id": self.eval_node_id,
@@ -136,6 +146,8 @@ class ExecutionPlan:
             "upstream_count": len(self.upstream_nodes),
             "fallback_count": len(self.fallback_nodes),
             "tile_native": self.tile_native,
+            "span_count": len(self.spans),
+            "vulkan_span_count": vulkan_spans,
             "channel_key": self.request.channel_key,
             "precision": self.request.precision,
             "priority": self.request.priority,
@@ -160,10 +172,13 @@ def build_execution_plan(
     output_signature: str | None,
     eval_node_id: str | None = None,
     tile_native_types: set[str] | None = None,
+    vulkan_supported_types: set[str] | None = None,
+    prefer_vulkan: bool = False,
 ) -> ExecutionPlan:
     started = time.perf_counter()
     resolved_eval_node = eval_node_id or request.node_id
     native_types = tile_native_types or set()
+    vulkan_types = vulkan_supported_types or set()
     graph_digest = graph_hash(graph)
     plan_nodes: list[ExecutionPlanNode] = []
     upstream: list[str] = []
@@ -190,7 +205,9 @@ def build_execution_plan(
         child_tile_native = True
         for child_id in input_nodes:
             child_tile_native = walk(child_id) and child_tile_native
-        tile_native = node.type.lower() in native_types and child_tile_native
+        node_type_normalized = node.type.lower()
+        tile_native = node_type_normalized in native_types and child_tile_native
+        execution_backend = "vulkan" if prefer_vulkan and node_type_normalized in vulkan_types and not disabled else "cpu"
         if not tile_native:
             fallback.append(node_id)
         upstream.append(node_id)
@@ -202,6 +219,7 @@ def build_execution_plan(
                 disabled=disabled,
                 bypass_socket=bypass_socket,
                 tile_native=tile_native,
+                execution_backend=execution_backend,
             )
         )
         visiting.remove(node_id)
@@ -216,6 +234,7 @@ def build_execution_plan(
         "eval_node_id": resolved_eval_node,
     }
     cache_key = hashlib.sha1(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+    spans = _build_execution_spans(plan_nodes)
     return ExecutionPlan(
         request=request,
         graph_hash=graph_digest,
@@ -225,9 +244,42 @@ def build_execution_plan(
         fallback_nodes=tuple(fallback),
         tile_native=plan_tile_native,
         nodes=tuple(plan_nodes),
+        spans=tuple(spans),
         cache_key=cache_key,
         build_ms=(time.perf_counter() - started) * 1000.0,
     )
+
+
+def _build_execution_spans(plan_nodes: list[ExecutionPlanNode]) -> list[ExecutionPlanSpan]:
+    spans: list[ExecutionPlanSpan] = []
+    current_backend: str | None = None
+    current_nodes: list[str] = []
+    current_tile_native = True
+    for node in plan_nodes:
+        if current_backend is None or node.execution_backend != current_backend:
+            if current_nodes:
+                spans.append(
+                    ExecutionPlanSpan(
+                        backend=current_backend or "cpu",
+                        node_ids=tuple(current_nodes),
+                        tile_native=current_tile_native,
+                    )
+                )
+            current_backend = node.execution_backend
+            current_nodes = [node.node_id]
+            current_tile_native = node.tile_native
+            continue
+        current_nodes.append(node.node_id)
+        current_tile_native = current_tile_native and node.tile_native
+    if current_nodes:
+        spans.append(
+            ExecutionPlanSpan(
+                backend=current_backend or "cpu",
+                node_ids=tuple(current_nodes),
+                tile_native=current_tile_native,
+            )
+        )
+    return spans
 
 
 def _disabled_and_bypass_socket(graph: ProjectGraph, node_id: str) -> tuple[bool, str | None]:

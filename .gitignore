@@ -190,3 +190,7 @@ yarn-error.log*
 /scripts
 /tmp
 /scripts
+/backend/opencomp/gpu/shaders/compiled
+.codex_*.json
+.codex_*.log
+/.codex_debug

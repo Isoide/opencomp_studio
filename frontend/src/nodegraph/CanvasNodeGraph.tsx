@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import type { NodeModel, ProjectGraph } from "../api/client";
+import type { NodeModel, ProjectGraph, RequestTiming } from "../api/client";
 import type { SocketEndpoint } from "../store/appStore";
 
 type Props = {
@@ -10,8 +10,15 @@ type Props = {
   onMoveNode: (nodeId: string, position: [number, number]) => void;
   onConnect: (from: SocketEndpoint, to: SocketEndpoint) => void;
   onPointerWorldPosition: (position: [number, number]) => void;
-  activeNodeIds: string[];
+  foregroundActiveNodeIds: string[];
+  backgroundActiveNodeIds: string[];
   nodeTimings: Record<string, { type: string; duration_ms: number; cache_hit: boolean; timestamp: number }>;
+  nodeErrors: Record<string, string>;
+  activeViewerNodeId: string;
+  frontendViewerTiming: RequestTiming | null;
+  executionBackend: "auto" | "cpu" | "vulkan";
+  gpuRuntimeAvailable: boolean;
+  gpuSupportedNodeTypes: string[];
 };
 
 const NODE_W = 128;
@@ -32,8 +39,15 @@ export function CanvasNodeGraph({
   onMoveNode,
   onConnect,
   onPointerWorldPosition,
-  activeNodeIds,
+  foregroundActiveNodeIds,
+  backgroundActiveNodeIds,
   nodeTimings,
+  nodeErrors,
+  activeViewerNodeId,
+  frontendViewerTiming,
+  executionBackend,
+  gpuRuntimeAvailable,
+  gpuSupportedNodeTypes,
 }: Props) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [viewport, setViewport] = useState<Viewport>({ x: 64, y: 32, scale: 1 });
@@ -63,11 +77,18 @@ export function CanvasNodeGraph({
       graph,
       selectedNodeId,
       viewport,
-      new Set(activeNodeIds),
+      new Set(foregroundActiveNodeIds),
+      new Set(backgroundActiveNodeIds),
       nodeTimings,
+      nodeErrors,
+      activeViewerNodeId,
+      frontendViewerTiming,
+      executionBackend,
+      gpuRuntimeAvailable,
+      new Set(gpuSupportedNodeTypes.map((item) => item.toLowerCase())),
       dragging?.mode === "connection" ? dragging : null,
     );
-  }, [activeNodeIds, dragging, graph, nodeTimings, selectedNodeId, viewport]);
+  }, [activeViewerNodeId, backgroundActiveNodeIds, dragging, executionBackend, foregroundActiveNodeIds, frontendViewerTiming, gpuRuntimeAvailable, gpuSupportedNodeTypes, graph, nodeErrors, nodeTimings, selectedNodeId, viewport]);
 
   const screenToWorld = (x: number, y: number): [number, number] => [
     (x - viewport.x) / viewport.scale,
@@ -188,8 +209,15 @@ function draw(
   graph: ProjectGraph | null,
   selectedNodeId: string | null,
   viewport: Viewport,
-  activeNodeIds: Set<string>,
+  foregroundActiveNodeIds: Set<string>,
+  backgroundActiveNodeIds: Set<string>,
   nodeTimings: Record<string, { type: string; duration_ms: number; cache_hit: boolean; timestamp: number }>,
+  nodeErrors: Record<string, string>,
+  activeViewerNodeId: string,
+  frontendViewerTiming: RequestTiming | null,
+  executionBackend: "auto" | "cpu" | "vulkan",
+  gpuRuntimeAvailable: boolean,
+  gpuSupportedNodeTypes: Set<string>,
   connectionDrag: { from: SocketEndpoint; x: number; y: number } | null,
 ) {
   ctx.clearRect(0, 0, width, height);
@@ -202,6 +230,8 @@ function draw(
   ctx.translate(viewport.x, viewport.y);
   ctx.scale(viewport.scale, viewport.scale);
 
+  const errorHighlights = collectErrorHighlights(graph, nodeErrors);
+
   for (const edge of graph.edges) {
     const source = graph.nodes[edge.source_node];
     const target = graph.nodes[edge.target_node];
@@ -210,8 +240,21 @@ function draw(
     const [tx, ty] = inputPoint(target, edge.target_socket);
     const viewerEdge = target.type.toLowerCase() === "viewer";
     const activeViewerEdge = viewerEdge && String(target.params.active_input ?? "0") === edge.target_socket;
+    const activeFrontendViewerEdge =
+      activeViewerEdge &&
+      target.id === activeViewerNodeId &&
+      frontendViewerTiming?.node_id === activeViewerNodeId &&
+      frontendViewerTiming.type === "frontend_viewer_frame";
+    const erroredEdge = errorHighlights.edgeIds.has(edge.id);
     ctx.save();
-    if (viewerEdge) {
+    if (erroredEdge) {
+      ctx.globalAlpha = 0.92;
+      ctx.shadowColor = "#8f1f1f";
+      ctx.shadowBlur = 10 / viewport.scale;
+      ctx.strokeStyle = "#ff6262";
+      ctx.lineWidth = 3.2 / viewport.scale;
+      ctx.setLineDash(viewerEdge ? [6 / viewport.scale, 6 / viewport.scale] : []);
+    } else if (viewerEdge) {
       ctx.globalAlpha = activeViewerEdge ? 0.64 : 0.28;
       ctx.strokeStyle = activeViewerEdge ? "#77c8b4" : "#8a846f";
       ctx.lineWidth = (activeViewerEdge ? 1.6 : 1) / viewport.scale;
@@ -228,9 +271,12 @@ function draw(
     ctx.restore();
 
     if (viewerEdge) {
-      ctx.fillStyle = activeViewerEdge ? "#b7fff0" : "#9f9585";
+      ctx.fillStyle = erroredEdge ? "#ffd1d1" : activeViewerEdge ? "#b7fff0" : "#9f9585";
       ctx.font = "10px Segoe UI, sans-serif";
       ctx.fillText(edge.target_socket, tx - 3, ty - 8);
+    }
+    if (activeFrontendViewerEdge && isRecentTiming(frontendViewerTiming.timestamp)) {
+      drawEdgeTimingBadge(ctx, sx, sy, tx, ty, `${Math.round(frontendViewerTiming.total_ms)}ms`, viewport.scale);
     }
   }
 
@@ -254,29 +300,33 @@ function draw(
   for (const node of Object.values(graph.nodes)) {
     const [x, y] = node.position;
     const selected = node.id === selectedNodeId;
-    const active = activeNodeIds.has(node.id);
+    const foregroundActive = foregroundActiveNodeIds.has(node.id);
+    const backgroundActive = !foregroundActive && backgroundActiveNodeIds.has(node.id);
     const disabled = isNodeDisabled(node);
+    const failed = !disabled && Boolean(nodeErrors[node.id]);
+    const errorPathNode = !disabled && !failed && errorHighlights.nodeIds.has(node.id);
     const timing = nodeTimings[node.id];
-    if (active) {
+    if (failed || errorPathNode || foregroundActive || backgroundActive) {
       ctx.save();
-      ctx.shadowColor = "#77c8b4";
-      ctx.shadowBlur = 22 / viewport.scale;
-      ctx.strokeStyle = "#77c8b4";
-      ctx.lineWidth = 4 / viewport.scale;
+      ctx.shadowColor = failed || errorPathNode ? "#ff5c5c" : "#77c8b4";
+      ctx.shadowBlur = (failed ? 20 : errorPathNode ? 14 : foregroundActive ? 22 : 12) / viewport.scale;
+      ctx.globalAlpha = failed ? 0.95 : errorPathNode ? 0.72 : foregroundActive ? 1 : 0.5;
+      ctx.strokeStyle = failed ? "#ff5c5c" : errorPathNode ? "#cb7777" : foregroundActive ? "#77c8b4" : "#5ea89a";
+      ctx.lineWidth = (failed || foregroundActive ? 4 : errorPathNode ? 2.6 : 2) / viewport.scale;
       roundRect(ctx, x - 4, y - 4, NODE_W + 8, NODE_H + 8, 10);
       ctx.stroke();
       ctx.restore();
     }
-    ctx.fillStyle = disabled ? "#1f1f1f" : selected ? "#2b4f4a" : "#242424";
+    ctx.fillStyle = disabled ? "#1f1f1f" : failed ? "#3a1717" : errorPathNode ? "#2f2121" : selected ? "#2b4f4a" : "#242424";
     roundRect(ctx, x, y, NODE_W, NODE_H, 8);
     ctx.fill();
-    ctx.strokeStyle = disabled ? "#8d8070" : selected ? "#5ed0bb" : "#57534a";
+    ctx.strokeStyle = disabled ? "#8d8070" : failed ? "#ff7777" : errorPathNode ? "#bb7a7a" : selected ? "#5ed0bb" : "#57534a";
     ctx.lineWidth = (selected ? 2 : 1) / viewport.scale;
     if (disabled) ctx.setLineDash([4 / viewport.scale, 3 / viewport.scale]);
     ctx.stroke();
     ctx.setLineDash([]);
 
-    ctx.fillStyle = disabled ? "#3e3a34" : nodeColor(node.type);
+    ctx.fillStyle = disabled ? "#3e3a34" : failed ? "#b23030" : errorPathNode ? "#6e4747" : nodeColor(node.type);
     roundRect(ctx, x, y, NODE_W, 18, 8);
     ctx.fill();
     ctx.fillStyle = "#f6f1e5";
@@ -285,7 +335,7 @@ function draw(
     ctx.fillStyle = "#cfc7b5";
     ctx.font = "11px Segoe UI, sans-serif";
     const detail = node.type.toLowerCase() === "viewer" ? `input ${String(node.params.active_input ?? "0")}` : node.id;
-    ctx.fillText(disabled ? `disabled -> ${bypassLabel(node)}` : detail, x + 10, y + 38);
+    ctx.fillText(disabled ? `disabled -> ${bypassLabel(node)}` : failed ? "error" : errorPathNode ? "error path" : detail, x + 10, y + 38);
     if (disabled) {
       ctx.save();
       ctx.strokeStyle = "#b29b72";
@@ -297,7 +347,7 @@ function draw(
       ctx.stroke();
       ctx.restore();
     }
-    if (timing && !active) {
+    if (timing && !foregroundActive && !backgroundActive) {
       const ageSeconds = Date.now() / 1000 - timing.timestamp;
       if (ageSeconds < 8) {
         ctx.fillStyle = timing.cache_hit ? "#77c8b4" : "#d8c58a";
@@ -310,6 +360,9 @@ function draw(
       ctx.beginPath();
       ctx.arc(x + NODE_W - 12, y + 9, 4, 0, Math.PI * 2);
       ctx.fill();
+    }
+    if (showsGpuBadge(node, executionBackend, gpuRuntimeAvailable, gpuSupportedNodeTypes)) {
+      drawGpuBadge(ctx, x + NODE_W - 34, y + 22, viewport.scale);
     }
 
     ctx.fillStyle = "#141414";
@@ -369,6 +422,89 @@ function inputSockets(node: NodeModel): string[] {
   if (normalized === "merge" || normalized === "channelmerge") return ["a", "b", "mask"];
   if (normalized === "copy" || normalized === "shuffle" || normalized === "comparemetadata" || normalized === "copymetadata") return ["a", "b"];
   return [defaultInputSocket(node.type)];
+}
+
+function collectErrorHighlights(graph: ProjectGraph, nodeErrors: Record<string, string>): {
+  edgeIds: Set<string>;
+  nodeIds: Set<string>;
+} {
+  const errorNodeIds = Object.keys(nodeErrors).filter((nodeId) => Boolean(nodeErrors[nodeId]) && graph.nodes[nodeId]);
+  if (errorNodeIds.length === 0) {
+    return { edgeIds: new Set(), nodeIds: new Set() };
+  }
+  const outgoing = new Map<string, typeof graph.edges>();
+  const incoming = new Map<string, typeof graph.edges>();
+  for (const edge of graph.edges) {
+    const nextOutgoing = outgoing.get(edge.source_node) ?? [];
+    nextOutgoing.push(edge);
+    outgoing.set(edge.source_node, nextOutgoing);
+    const nextIncoming = incoming.get(edge.target_node) ?? [];
+    nextIncoming.push(edge);
+    incoming.set(edge.target_node, nextIncoming);
+  }
+  const memo = new Map<string, boolean>();
+  const edgeIds = new Set<string>();
+  const nodeIds = new Set<string>();
+
+  const reachesViewer = (nodeId: string, visiting: Set<string>): boolean => {
+    if (memo.has(nodeId)) return memo.get(nodeId) ?? false;
+    if (visiting.has(nodeId)) return false;
+    visiting.add(nodeId);
+    let found = false;
+    for (const edge of outgoing.get(nodeId) ?? []) {
+      const target = graph.nodes[edge.target_node];
+      if (!target) continue;
+      if (!edgeParticipatesInNode(target, edge, incoming.get(target.id) ?? [])) continue;
+      if (target.type.toLowerCase() === "viewer") {
+        edgeIds.add(edge.id);
+        nodeIds.add(nodeId);
+        found = true;
+        continue;
+      }
+      if (reachesViewer(target.id, visiting)) {
+        edgeIds.add(edge.id);
+        nodeIds.add(nodeId);
+        nodeIds.add(target.id);
+        found = true;
+      }
+    }
+    visiting.delete(nodeId);
+    memo.set(nodeId, found);
+    return found;
+  };
+
+  for (const nodeId of errorNodeIds) {
+    reachesViewer(nodeId, new Set());
+  }
+  return { edgeIds, nodeIds };
+}
+
+function edgeParticipatesInNode(node: NodeModel, edge: ProjectGraph["edges"][number], incomingEdges: ProjectGraph["edges"]): boolean {
+  const normalized = node.type.toLowerCase();
+  if (normalized === "viewer") {
+    return String(node.params.active_input ?? "0") === edge.target_socket;
+  }
+  if (!isNodeDisabled(node)) {
+    return true;
+  }
+  return edge.target_socket === preferredBypassSocket(node, incomingEdges);
+}
+
+function preferredBypassSocket(node: NodeModel, incomingEdges: ProjectGraph["edges"]): string {
+  const priorities =
+    node.type.toLowerCase() === "merge" ? ["b", "bg", "a", "in", "input", "0", "mask"] : ["a", "in", "input", "0", "b", "mask"];
+  const ordered = [...incomingEdges].sort((left, right) => {
+    const leftPriority = socketPriority(left.target_socket, priorities);
+    const rightPriority = socketPriority(right.target_socket, priorities);
+    return leftPriority - rightPriority || left.target_socket.localeCompare(right.target_socket) || left.source_node.localeCompare(right.source_node);
+  });
+  return ordered[0]?.target_socket ?? defaultInputSocket(node.type);
+}
+
+function socketPriority(socket: string, priorities: string[]): number {
+  const normalized = socket.trim().toLowerCase();
+  const index = priorities.indexOf(normalized);
+  return index >= 0 ? index : priorities.length;
 }
 
 function isNodeDisabled(node: NodeModel): boolean {
@@ -461,6 +597,82 @@ function drawViewerInputs(
   }
 }
 
+function drawGpuBadge(ctx: CanvasRenderingContext2D, x: number, y: number, scale: number) {
+  ctx.save();
+  const radius = 5;
+  ctx.fillStyle = "#0d2b25";
+  ctx.strokeStyle = "#77c8b4";
+  ctx.lineWidth = 1 / scale;
+  roundRect(ctx, x, y, 26, 12, radius);
+  ctx.fill();
+  ctx.stroke();
+  ctx.fillStyle = "#c8fff1";
+  ctx.font = `${8 / Math.max(scale, 0.75)}px Segoe UI, sans-serif`;
+  ctx.fillText("GPU", x + 4, y + 8.5);
+  ctx.restore();
+}
+
+function drawEdgeTimingBadge(
+  ctx: CanvasRenderingContext2D,
+  sx: number,
+  sy: number,
+  tx: number,
+  ty: number,
+  label: string,
+  scale: number,
+) {
+  const { x, y } = cubicBezierPoint(
+    sx,
+    sy,
+    sx,
+    sy + 56,
+    tx,
+    ty - 56,
+    tx,
+    ty,
+    0.5,
+  );
+  ctx.save();
+  ctx.font = `${9 / Math.max(scale, 0.75)}px Segoe UI, sans-serif`;
+  const paddingX = 6 / Math.max(scale, 0.75);
+  const boxHeight = 14 / Math.max(scale, 0.75);
+  const textWidth = ctx.measureText(label).width;
+  const boxWidth = textWidth + paddingX * 2;
+  const boxX = x - boxWidth / 2;
+  const boxY = y - boxHeight / 2;
+  ctx.fillStyle = "rgba(18, 30, 28, 0.92)";
+  ctx.strokeStyle = "#77c8b4";
+  ctx.lineWidth = 1 / scale;
+  roundRect(ctx, boxX, boxY, boxWidth, boxHeight, 5 / Math.max(scale, 0.75));
+  ctx.fill();
+  ctx.stroke();
+  ctx.fillStyle = "#c8fff1";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(label, x, y + 0.5 / Math.max(scale, 0.75));
+  ctx.restore();
+}
+
+function cubicBezierPoint(
+  x0: number,
+  y0: number,
+  x1: number,
+  y1: number,
+  x2: number,
+  y2: number,
+  x3: number,
+  y3: number,
+  t: number,
+) {
+  const mt = 1 - t;
+  const mt2 = mt * mt;
+  const t2 = t * t;
+  return {
+    x: mt2 * mt * x0 + 3 * mt2 * t * x1 + 3 * mt * t2 * x2 + t2 * t * x3,
+    y: mt2 * mt * y0 + 3 * mt2 * t * y1 + 3 * mt * t2 * y2 + t2 * t * y3,
+  };
+}
+
 function drawGrid(ctx: CanvasRenderingContext2D, width: number, height: number, viewport: Viewport) {
   ctx.strokeStyle = "#252525";
   ctx.lineWidth = 1;
@@ -496,6 +708,23 @@ function nodeColor(type: string) {
   if (["shuffle", "copy", "addchannels", "remove", "premult", "unpremult"].includes(normalized)) return "#5f3f55";
   if (normalized.includes("metadata") || normalized === "addtimecode") return "#4f5540";
   return "#4b4b4b";
+}
+
+function isRecentTiming(timestampSeconds: number | undefined, maxAgeSeconds = 8) {
+  if (!timestampSeconds) return false;
+  return Date.now() / 1000 - timestampSeconds < maxAgeSeconds;
+}
+
+function showsGpuBadge(
+  node: NodeModel,
+  executionBackend: "auto" | "cpu" | "vulkan",
+  gpuRuntimeAvailable: boolean,
+  gpuSupportedNodeTypes: Set<string>,
+) {
+  if (executionBackend === "cpu") return false;
+  if (!gpuRuntimeAvailable) return false;
+  if (isNodeDisabled(node)) return false;
+  return gpuSupportedNodeTypes.has(node.type.toLowerCase());
 }
 
 function clamp(value: number, min: number, max: number) {

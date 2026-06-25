@@ -1,0 +1,234 @@
+{
+  "schema_version": "0.1.0",
+  "project_name": "Local Read Viewer Check",
+  "settings": {
+    "fps": 24,
+    "frame_start": 1001,
+    "frame_end": 1002,
+    "width": 4096,
+    "height": 3024,
+    "working_colorspace": "ACES2065-1",
+    "ocio_config": null,
+    "viewer_display": "sRGB - Display",
+    "viewer_view": "ACES 2.0 - SDR 100 nits (Rec.709)",
+    "proxy_enabled": true,
+    "viewer_max_width": 1280,
+    "viewer_max_height": 720,
+    "project_path": null,
+    "default_output_path": "renders/output.####.png",
+    "cache_enabled": true,
+    "auto_refresh": true,
+    "tile_rendering_enabled": true,
+    "tile_height": 64,
+    "tile_workers": 4,
+    "render_workers": 4,
+    "read_workers": 4,
+    "viewer_tile_lanes": 3,
+    "execution_backend": "auto",
+    "image_io_backend": "auto",
+    "gpu_memory_limit_mb": 2048,
+    "gpu_warm_neighbor_frames": 2
+  },
+  "graph": {
+    "nodes": {
+      "Read1": {
+        "id": "Read1",
+        "type": "Read",
+        "name": "Read1",
+        "position": [
+          120,
+          80
+        ],
+        "params": {
+          "path": "G:\\PIPELINE_DEVELOPMENTS\\GIT\\opencomp_studio\\renders\\LAL_105_523_0010_slapcomp_####.exr",
+          "colorspace": "ACES2065-1",
+          "frame_start": 1001,
+          "frame_end": 1002,
+          "before": "hold",
+          "after": "hold",
+          "missing_frames": "error",
+          "auto_alpha": true
+        },
+        "param_expressions": {},
+        "inputs": {},
+        "outputs": {
+          "out": "ImageFrame"
+        }
+      },
+      "Grade1": {
+        "id": "Grade1",
+        "type": "Grade",
+        "name": "Grade1",
+        "position": [
+          120,
+          220
+        ],
+        "params": {
+          "gain": 1,
+          "offset": 0,
+          "gamma": 1
+        },
+        "param_expressions": {},
+        "inputs": {},
+        "outputs": {
+          "out": "ImageFrame"
+        }
+      },
+      "Viewer1": {
+        "id": "Viewer1",
+        "type": "Viewer",
+        "name": "Viewer1",
+        "position": [
+          120,
+          380
+        ],
+        "params": {
+          "active_input": "0"
+        },
+        "param_expressions": {},
+        "inputs": {},
+        "outputs": {
+          "out": "ImageFrame"
+        }
+      }
+    },
+    "edges": [
+      {
+        "id": "e-read-grade",
+        "source_node": "Read1",
+        "source_socket": "out",
+        "target_node": "Grade1",
+        "target_socket": "in"
+      },
+      {
+        "id": "e-grade-viewer",
+        "source_node": "Grade1",
+        "source_socket": "out",
+        "target_node": "Viewer1",
+        "target_socket": "0"
+      }
+    ]
+  },
+  "script_tabs": [
+    {
+      "id": "main",
+      "name": "Comp 1",
+      "graph": {
+        "nodes": {
+          "Read1": {
+            "id": "Read1",
+            "type": "Read",
+            "name": "Read1",
+            "position": [
+              120,
+              80
+            ],
+            "params": {
+              "path": "G:\\PIPELINE_DEVELOPMENTS\\GIT\\opencomp_studio\\renders\\LAL_105_523_0010_slapcomp_####.exr",
+              "colorspace": "ACES2065-1",
+              "frame_start": 1001,
+              "frame_end": 1002,
+              "before": "hold",
+              "after": "hold",
+              "missing_frames": "error",
+              "auto_alpha": true
+            },
+            "param_expressions": {},
+            "inputs": {},
+            "outputs": {
+              "out": "ImageFrame"
+            }
+          },
+          "Grade1": {
+            "id": "Grade1",
+            "type": "Grade",
+            "name": "Grade1",
+            "position": [
+              120,
+              220
+            ],
+            "params": {
+              "gain": 1,
+              "offset": 0,
+              "gamma": 1
+            },
+            "param_expressions": {},
+            "inputs": {},
+            "outputs": {
+              "out": "ImageFrame"
+            }
+          },
+          "Viewer1": {
+            "id": "Viewer1",
+            "type": "Viewer",
+            "name": "Viewer1",
+            "position": [
+              120,
+              380
+            ],
+            "params": {
+              "active_input": "0"
+            },
+            "param_expressions": {},
+            "inputs": {},
+            "outputs": {
+              "out": "ImageFrame"
+            }
+          }
+        },
+        "edges": [
+          {
+            "id": "e-read-grade",
+            "source_node": "Read1",
+            "source_socket": "out",
+            "target_node": "Grade1",
+            "target_socket": "in"
+          },
+          {
+            "id": "e-grade-viewer",
+            "source_node": "Grade1",
+            "source_socket": "out",
+            "target_node": "Viewer1",
+            "target_socket": "0"
+          }
+        ]
+      },
+      "path": null,
+      "startup_scripts": [],
+      "kind": "comp"
+    }
+  ],
+  "active_script_id": "main",
+  "preferences": {
+    "autosave_seconds": 300,
+    "idle_autosave_seconds": 5,
+    "cache_memory_limit_mb": 1024,
+    "viewer_zoom_speed": 1.1,
+    "wheel_zoom_enabled": true,
+    "auto_connect_new_nodes": true,
+    "default_read_colorspace": "ACES2065-1",
+    "custom_init_scripts": [],
+    "path_substitutions": [],
+    "hotkeys": {
+      "add_read": "r",
+      "add_write": "w",
+      "add_merge": "m",
+      "add_shuffle": "s",
+      "add_group": "g",
+      "refresh_viewer": "u",
+      "fit_viewer": "f"
+    }
+  },
+  "plugin_menu": [
+    {
+      "label": "Run Python Script",
+      "command": "python_script",
+      "path": ""
+    },
+    {
+      "label": "Reload Menu Plugins",
+      "command": "reload_plugins"
+    }
+  ],
+  "startup_scripts": []
+}

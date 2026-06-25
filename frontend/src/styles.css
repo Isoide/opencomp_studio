@@ -680,6 +680,25 @@ button:disabled {
   align-items: end;
 }
 
+.viewer-profile-controls {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.viewer-profile-controls button.active {
+  border-color: #d8b15b;
+  background: #3b2b13;
+  color: #fff1cb;
+}
+
+.viewer-profile-controls span {
+  font-size: 11px;
+  color: #b9b09e;
+}
+
 .viewer-proxy-controls .toggle-label {
   min-height: 30px !important;
 }
@@ -904,6 +923,23 @@ button:disabled {
   color: #9f9585;
 }
 
+.viewer-error-overlay {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  z-index: 5;
+  max-width: min(720px, calc(100% - 32px));
+  transform: translate(-50%, -50%);
+  border: 1px solid #a24444;
+  border-radius: 8px;
+  padding: 14px 16px;
+  color: #ffe4e4;
+  background: rgb(43 12 12 / 94%);
+  box-shadow: 0 16px 48px rgb(0 0 0 / 45%);
+  text-align: center;
+  white-space: pre-wrap;
+}
+
 .inspector {
   gap: 10px;
   padding-bottom: 12px;
@@ -945,6 +981,25 @@ button:disabled {
 .root-settings {
   display: grid;
   gap: 10px;
+}
+
+.preset-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  padding: 0 10px;
+}
+
+.preset-controls button.active {
+  border-color: #d8b15b;
+  background: #3b2b13;
+  color: #fff1cb;
+}
+
+.preset-controls span {
+  font-size: 11px;
+  color: #b9b09e;
 }
 
 .inspector-actions {
@@ -1144,6 +1199,12 @@ button:disabled {
 
 .render-state.active {
   color: #d8c58a;
+}
+
+.render-state.error {
+  color: #ffd0d0;
+  border-color: #8c3939;
+  background: #2a1111;
 }
 
 .script-settings {

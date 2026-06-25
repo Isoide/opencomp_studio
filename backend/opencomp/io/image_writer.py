@@ -1,3 +1,10 @@
+"""Image writing helpers for OpenComp output nodes and CLI renders.
+
+This module resolves sequence tokens, selects channel payloads, and dispatches
+writes to Pillow, OpenImageIO, or OpenEXR backends. It keeps file-format
+details and metadata serialization out of node evaluation code.
+"""
+
 from __future__ import annotations
 
 import re
@@ -9,6 +16,8 @@ from PIL import Image
 from PIL.PngImagePlugin import PngInfo
 
 from opencomp.core.models import ImageFrame
+from opencomp.io.backend_support import resolve_exr_backend_modules
+from opencomp.io.path_utils import local_path
 
 
 def write_image(
@@ -18,8 +27,11 @@ def write_image(
     metadata_policy: str = "all",
     channels: str = "rgba",
     create_directories: bool = True,
+    backend: str = "auto",
 ) -> Path:
-    output_path = Path(_resolve_frame_path(path, frame.frame))
+    """Write one frame to disk using the requested raster or EXR backend."""
+
+    output_path = local_path(path, frame.frame)
     if output_path.exists() and not overwrite:
         raise FileExistsError(f"Output already exists and overwrite is disabled: {output_path}")
     suffix = output_path.suffix.lower()
@@ -28,7 +40,7 @@ def write_image(
     elif not output_path.parent.exists():
         raise FileNotFoundError(f"Output directory does not exist: {output_path.parent}")
     if suffix == ".exr":
-        _write_exr(frame, output_path, metadata_policy, channels)
+        _write_exr(frame, output_path, metadata_policy, channels, backend=backend)
         return output_path
     if suffix not in {".png", ".jpg", ".jpeg"}:
         raise NotImplementedError("MVP writer supports EXR/PNG/JPG.")
@@ -45,11 +57,20 @@ def write_image(
     return output_path
 
 
-def _write_exr(frame: ImageFrame, output_path: Path, metadata_policy: str, channels: str) -> None:
+def _write_exr(frame: ImageFrame, output_path: Path, metadata_policy: str, channels: str, backend: str = "auto") -> None:
+    normalized_backend, oiio, _openexr = resolve_exr_backend_modules(backend)
+    if normalized_backend in {"auto", "oiio"} and oiio is not None:
+        try:
+            _write_exr_oiio(oiio, frame, output_path, metadata_policy, channels)
+            return
+        except Exception:
+            if normalized_backend == "oiio":
+                raise
+
     try:
         import OpenEXR  # type: ignore
     except ImportError as exc:
-        raise NotImplementedError("EXR writing requires the OpenEXR Python package.") from exc
+        raise NotImplementedError("EXR writing requires OpenEXR or OpenImageIO.") from exc
 
     data = np.ascontiguousarray(_selected_rgba(frame, channels)[:, :, :4], dtype=np.float32)
     if data.shape[2] < 4:
@@ -72,6 +93,30 @@ def _write_exr(frame: ImageFrame, output_path: Path, metadata_policy: str, chann
         return
 
     _write_exr_legacy(OpenEXR, data, header, output_path, frame, channels)
+
+
+def _write_exr_oiio(oiio: Any, frame: ImageFrame, output_path: Path, metadata_policy: str, channels: str) -> None:
+    channel_names, data = _oiio_exr_payload(frame, channels)
+    height, width, channel_count = data.shape
+    spec = oiio.ImageSpec(width, height, channel_count, oiio.FLOAT)
+    spec.channelnames = tuple(channel_names)
+    spec.attribute("PixelAspectRatio", float(frame.pixel_aspect))
+    spec.attribute("opencomp.colorspace", str(frame.colorspace))
+    spec.attribute("opencomp.frame", int(frame.frame))
+    if metadata_policy != "none":
+        for key, value in _exr_metadata(frame.metadata).items():
+            if isinstance(value, (str, int, float)):
+                spec.attribute(key, value)
+    output = oiio.ImageOutput.create(str(output_path))
+    if not output:
+        raise RuntimeError(oiio.geterror() if hasattr(oiio, "geterror") else f"Could not create EXR writer for {output_path}")
+    if not output.open(str(output_path), spec):
+        raise RuntimeError(output.geterror())
+    try:
+        if not output.write_image(np.ascontiguousarray(data, dtype=np.float32)):
+            raise RuntimeError(output.geterror())
+    finally:
+        output.close()
 
 
 def _write_exr_legacy(
@@ -112,16 +157,6 @@ def _ensure_rgba(data: np.ndarray) -> np.ndarray:
     return rgba
 
 
-def _resolve_frame_path(path: str, frame: int) -> str:
-    if "####" in path:
-        return path.replace("####", f"{frame:04d}")
-    if "%04d" in path:
-        return path % frame
-    if "%d" in path:
-        return path % frame
-    return path
-
-
 def _selected_rgba(frame: ImageFrame, channels: str) -> np.ndarray:
     selected = str(channels or "rgba").lower()
     data = frame.data.copy()
@@ -147,6 +182,28 @@ def _selected_rgba(frame: ImageFrame, channels: str) -> np.ndarray:
         if index not in keep:
             data[:, :, index] = 1.0 if index == 3 else 0.0
     return data
+
+
+def _oiio_exr_payload(frame: ImageFrame, channels: str) -> tuple[list[str], np.ndarray]:
+    selected = str(channels or "rgba").lower()
+    rgba = np.ascontiguousarray(_selected_rgba(frame, channels)[:, :, :4], dtype=np.float32)
+    if selected == "all":
+        names = ["R", "G", "B", "A"]
+        planes = [rgba[:, :, 0], rgba[:, :, 1], rgba[:, :, 2], rgba[:, :, 3]]
+        for layer, value in frame.channel_data.items():
+            channel_array = np.ascontiguousarray(value, dtype=np.float32)
+            if channel_array.ndim == 2:
+                names.append(layer)
+                planes.append(channel_array)
+                continue
+            suffixes = ("R", "G", "B", "A") if channel_array.shape[2] <= 4 else tuple(f"C{index}" for index in range(channel_array.shape[2]))
+            for index, suffix in enumerate(suffixes[: channel_array.shape[2]]):
+                names.append(f"{layer}.{suffix}")
+                planes.append(channel_array[:, :, index])
+        return names, np.stack(planes, axis=-1).astype(np.float32)
+    if selected == "rgb":
+        return ["R", "G", "B"], np.ascontiguousarray(rgba[:, :, :3], dtype=np.float32)
+    return ["R", "G", "B", "A"], rgba
 
 
 def _exr_v3_channels(frame: ImageFrame, rgba: np.ndarray, channels: str) -> dict[str, np.ndarray]:

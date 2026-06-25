@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Literal, Protocol
 
 from opencomp.color.ocio_engine import OCIOColorEngine
 from opencomp.core.channel_demand import ChannelDemand
@@ -51,6 +51,7 @@ class NodeDefinition:
     operation: NodeOperation
     inputs: tuple[str, ...] = ()
     outputs: tuple[str, ...] = ("out",)
+    execution_capability: Literal["cpu_only", "vulkan_supported", "vulkan_preferred"] = "cpu_only"
 
 
 class NodeEvaluationError(RuntimeError):

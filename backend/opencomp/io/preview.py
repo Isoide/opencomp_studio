@@ -35,12 +35,9 @@ def resize_float_rgba(
     if not max_width or not max_height:
         return np.ascontiguousarray(image)
 
-    height, width = image.shape[:2]
-    scale = min(max_width / width, max_height / height, 1.0)
-    if scale >= 1.0:
+    size = preview_resize_dimensions(int(image.shape[1]), int(image.shape[0]), max_width, max_height)
+    if size is None:
         return np.ascontiguousarray(image)
-
-    size = (max(1, int(width * scale)), max(1, int(height * scale)))
     planes = [
         np.asarray(
             Image.fromarray(np.ascontiguousarray(image[:, :, channel]), mode="F").resize(
@@ -64,10 +61,8 @@ def encode_preview_png(
         raise ValueError("Preview encoding requires an H x W x 4 RGBA array.")
     image_u8 = (np.clip(image, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
     if max_width and max_height:
-        height, width = image_u8.shape[:2]
-        scale = min(max_width / width, max_height / height, 1.0)
-        if scale < 1.0:
-            size = (max(1, int(width * scale)), max(1, int(height * scale)))
+        size = preview_resize_dimensions(int(image_u8.shape[1]), int(image_u8.shape[0]), max_width, max_height)
+        if size is not None:
             image_u8 = np.asarray(Image.fromarray(image_u8, mode="RGBA").resize(size, Image.Resampling.BILINEAR))
     output = BytesIO()
     Image.fromarray(image_u8, mode="RGBA").save(output, format="PNG")
@@ -122,6 +117,22 @@ def _aux_channel_preview(plane: np.ndarray) -> np.ndarray:
         alpha = np.ones((*plane.shape[:2], 1), dtype=np.float32)
         return np.ascontiguousarray(np.concatenate([rgb, alpha], axis=2))
     return _scalar_to_rgba(plane[:, :, 0], normalize=True)
+
+
+def preview_resize_dimensions(
+    width: int,
+    height: int,
+    max_width: int | None = None,
+    max_height: int | None = None,
+) -> tuple[int, int] | None:
+    width = max(1, int(width))
+    height = max(1, int(height))
+    if not max_width or not max_height:
+        return None
+    scale = min(max_width / width, max_height / height, 1.0)
+    if scale >= 1.0:
+        return None
+    return (max(1, int(width * scale)), max(1, int(height * scale)))
 
 
 def _scalar_to_rgba(plane: np.ndarray, normalize: bool) -> np.ndarray:

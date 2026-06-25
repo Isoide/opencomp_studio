@@ -11,20 +11,59 @@ import type {
   ProjectPreferences,
   ProjectSettings,
 } from "../api/client";
+import {
+  viewerFrameRenderKey,
+  viewerFrameDimensions,
+  viewerFrameFormatKey,
+  viewerFramePixelAspect,
+  viewerFrameTileProgress,
+} from "./viewerFrame";
+import {
+  nodeMetadataDataWindow,
+  nodeMetadataFormatBox,
+  nodeMetadataPixelAspect,
+  nodeMetadataScale,
+  nodeMetadataUsesProxy,
+  type SourceSize,
+} from "./viewerMetadata";
+import {
+  drawCheckerboard,
+  drawDraftGeometry,
+  drawResolutionBadge,
+  drawViewerImage,
+  drawWipeGuide,
+  drawWipeImage,
+  resizeCanvas,
+} from "./viewerCanvas";
+import {
+  clamp,
+  compactCacheStatus,
+  displaySize,
+  DraftPoint,
+  fitViewerTransform,
+  isNearWipeLine,
+  normalizeViewerRoi,
+  oneToOneViewerTransform,
+  RoiDragMode,
+  roiHitTest,
+  screenToImage,
+  updateViewerRoiFromDrag,
+  ViewerRoi,
+  ViewerTransform,
+  wipePositionFromPointer,
+  zoomViewerTransform,
+} from "./viewerGeometry";
+import {
+  formatCompactValue,
+  formatPixelValue,
+  PixelSample,
+  sampleFloatPixel,
+} from "./viewerPixels";
 import { WebglFloatViewerRenderer, type WebglViewerMetrics } from "./webglFloatViewer";
 
-type ViewerTool = "pan" | "crypto-add" | "crypto-remove" | "point" | "spline";
+type ViewerTool = "pan" | "crypto-add" | "crypto-remove" | "point" | "spline" | "roi";
 type ViewerCompareMode = "wipe" | "difference";
-type DraftPoint = { x: number; y: number };
-type SourceSize = { width: number; height: number };
-type PixelSample = {
-  x: number;
-  y: number;
-  rgba: [number, number, number, number];
-  swatch: string;
-  hsv: { h: number; s: number; v: number };
-  luma: number;
-};
+type ViewerProfilePreset = "speed" | "quality" | "custom";
 
 type Props = {
   imageUrl: string | null;
@@ -49,6 +88,7 @@ type Props = {
   wipePosition: number;
   wipeAngle: number;
   viewerTool: ViewerTool;
+  viewerRoi: ViewerRoi | null;
   cryptomatteLayers: CryptomatteLayer[];
   cryptoLayer: string;
   cryptoSelection: CryptomattePick[];
@@ -58,9 +98,12 @@ type Props = {
   isPlaying: boolean;
   isRendering: boolean;
   renderStatus: string | null;
+  renderError: string | null;
+  viewerProfilePreset: ViewerProfilePreset;
   onTogglePlayback: () => void;
   onFrameChange: (frame: number) => void;
   onRefresh: () => void;
+  onApplyViewerProfile: (profile: Exclude<ViewerProfilePreset, "custom">) => void;
   onDisplayChange: (display: string | null) => void;
   onViewChange: (view: string | null) => void;
   onProxyEnabledChange: (enabled: boolean) => void;
@@ -74,6 +117,7 @@ type Props = {
   onWipePositionChange: (position: number) => void;
   onWipeAngleChange: (angle: number) => void;
   onViewerToolChange: (tool: ViewerTool) => void;
+  onViewerRoiChange: (roi: ViewerRoi | null) => void;
   onCryptoLayerChange: (layer: string) => void;
   onCryptoPreviewChange: (enabled: boolean) => void;
   onCryptoClear: () => void;
@@ -82,12 +126,6 @@ type Props = {
   onClearCache: () => void;
   onGpuMetrics: (metrics: WebglViewerMetrics | null) => void;
   onClose: () => void;
-};
-
-type ViewerTransform = {
-  x: number;
-  y: number;
-  scale: number;
 };
 
 export function ViewerPanel({
@@ -113,6 +151,7 @@ export function ViewerPanel({
   wipePosition,
   wipeAngle,
   viewerTool,
+  viewerRoi,
   cryptomatteLayers,
   cryptoLayer,
   cryptoSelection,
@@ -122,9 +161,12 @@ export function ViewerPanel({
   isPlaying,
   isRendering,
   renderStatus,
+  renderError,
+  viewerProfilePreset,
   onTogglePlayback,
   onFrameChange,
   onRefresh,
+  onApplyViewerProfile,
   onDisplayChange,
   onViewChange,
   onProxyEnabledChange,
@@ -138,6 +180,7 @@ export function ViewerPanel({
   onWipePositionChange,
   onWipeAngleChange,
   onViewerToolChange,
+  onViewerRoiChange,
   onCryptoLayerChange,
   onCryptoPreviewChange,
   onCryptoClear,
@@ -159,9 +202,9 @@ export function ViewerPanel({
   const gpuRecoveryRef = useRef<{ key: string; attempts: number }>({ key: "", attempts: 0 });
   const dragRef = useRef<{ x: number; y: number; transform: ViewerTransform } | null>(null);
   const wipeDragRef = useRef(false);
+  const roiDragRef = useRef<{ mode: RoiDragMode; startPoint: DraftPoint; startRoi: ViewerRoi | null } | null>(null);
   const [transform, setTransform] = useState<ViewerTransform>({ x: 0, y: 0, scale: 1 });
   const [imageSize, setImageSize] = useState({ width: 0, height: 0 });
-  const [compareImageSize, setCompareImageSize] = useState({ width: 0, height: 0 });
   const [bitmapRevision, setBitmapRevision] = useState(0);
   const [draftPoints, setDraftPoints] = useState<DraftPoint[]>([]);
   const [showBbox, setShowBbox] = useState(true);
@@ -169,20 +212,22 @@ export function ViewerPanel({
   const [pixelSample, setPixelSample] = useState<PixelSample | null>(null);
   const [cacheHudCollapsed, setCacheHudCollapsed] = useState(true);
   const [viewerHudCollapsed, setViewerHudCollapsed] = useState(true);
-  const pixelAspect =
-    gpuFrame?.header.pixel_aspect && gpuFrame.header.pixel_aspect > 0
-      ? gpuFrame.header.pixel_aspect
-      : metadata?.pixel_aspect && metadata.pixel_aspect > 0
-        ? metadata.pixel_aspect
-        : 1;
+  const [draftRoi, setDraftRoi] = useState<ViewerRoi | null>(null);
+  const frameSize = viewerFrameDimensions(gpuFrame);
+  const tileProgress = viewerFrameTileProgress(gpuFrame);
+  const pixelAspect = viewerFramePixelAspect(gpuFrame) ?? nodeMetadataPixelAspect(metadata);
   const frameStart = settings?.frame_start ?? 1001;
   const frameEnd = settings?.frame_end ?? 1010;
   const viewerInputSlots = useMemo(() => Array.from({ length: 10 }, (_, index) => String(index)), []);
   const activeSource = useMemo<SourceSize | null>(() => {
-    if (gpuFrame) return { width: gpuFrame.header.width, height: gpuFrame.header.height };
+    if (frameSize) return frameSize;
     if (imageSize.width > 0 && imageSize.height > 0) return imageSize;
     return null;
-  }, [gpuFrame?.header.height, gpuFrame?.header.width, imageSize.height, imageSize.width]);
+  }, [frameSize, imageSize.height, imageSize.width]);
+  const activeDisplaySize = useMemo(
+    () => (activeSource ? displaySize(activeSource, pixelAspect) : null),
+    [activeSource, pixelAspect],
+  );
   const cacheHudText = useMemo(() => compactCacheStatus(cacheStatus), [cacheStatus]);
   const viewerHudText = useMemo(() => {
     if (!activeSource) return "";
@@ -194,10 +239,9 @@ export function ViewerPanel({
     ];
     if (pixelAspect !== 1) parts.push(`PA ${pixelAspect.toFixed(3)}`);
     parts.push(`F${frame}`);
-    if (gpuFrame?.header.partial) {
-      parts.push(`tiles ${gpuFrame.header.tiles_received ?? 0}/${gpuFrame.header.tile_count ?? 0}`);
-    }
-    if (metadata && activeSource.width < metadata.width) {
+    if (viewerRoi) parts.push(`ROI ${viewerRoi.width}x${viewerRoi.height}+${viewerRoi.x}+${viewerRoi.y}`);
+    if (tileProgress) parts.push(tileProgress);
+    if (nodeMetadataUsesProxy(metadata, activeSource)) {
       parts.push(`Proxy ${activeSource.width}x${activeSource.height}`);
     }
     return parts.join(" | ");
@@ -205,14 +249,13 @@ export function ViewerPanel({
     activeSource,
     frame,
     gpuFrame,
-    gpuFrame?.header.partial,
-    gpuFrame?.header.tile_count,
-    gpuFrame?.header.tiles_received,
     gpuStatus,
     metadata,
     pixelAspect,
     selectedChannel,
+    tileProgress,
     transform.scale,
+    viewerRoi,
   ]);
   const compactViewerHudText = useMemo(() => {
     const kind = gpuFrame ? (gpuStatus.toLowerCase().includes("fallback") ? "GPU fallback" : "GPU") : "CPU";
@@ -233,16 +276,8 @@ export function ViewerPanel({
       pendingFitRef.current = true;
       return;
     }
-    const displayWidth = source.width * pixelAspect;
-    const displayHeight = source.height;
-    const scale = Math.min(rect.width / displayWidth, rect.height / displayHeight) * 0.94;
-    const nextScale = Number.isFinite(scale) && scale > 0 ? scale : 1;
     pendingFitRef.current = false;
-    setTransform({
-      scale: nextScale,
-      x: (rect.width - displayWidth * nextScale) / 2,
-      y: (rect.height - displayHeight * nextScale) / 2,
-    });
+    setTransform(fitViewerTransform({ width: rect.width, height: rect.height }, source, pixelAspect));
   }, [activeSource, pixelAspect]);
 
   const setOneToOne = useCallback(() => {
@@ -250,12 +285,7 @@ export function ViewerPanel({
     const source = activeSource;
     if (!canvas || !source) return;
     const rect = canvas.getBoundingClientRect();
-    const displayWidth = source.width * pixelAspect;
-    setTransform({
-      scale: 1,
-      x: (rect.width - displayWidth) / 2,
-      y: (rect.height - source.height) / 2,
-    });
+    setTransform(oneToOneViewerTransform({ width: rect.width, height: rect.height }, source, pixelAspect));
   }, [activeSource, pixelAspect]);
 
   const zoomBy = useCallback(
@@ -265,16 +295,7 @@ export function ViewerPanel({
       const rect = canvas.getBoundingClientRect();
       const centerX = rect.width / 2;
       const centerY = rect.height / 2;
-      setTransform((current) => {
-        const worldX = (centerX - current.x) / current.scale;
-        const worldY = (centerY - current.y) / current.scale;
-        const scale = clamp(current.scale * factor, 0.05, 16);
-        return {
-          scale,
-          x: centerX - worldX * scale,
-          y: centerY - worldY * scale,
-        };
-      });
+      setTransform((current) => zoomViewerTransform(current, { x: centerX, y: centerY }, factor));
     },
     [activeSource],
   );
@@ -286,13 +307,12 @@ export function ViewerPanel({
         setPixelSample(null);
         return;
       }
-      const x = Math.floor((mouseX - transform.x) / transform.scale / pixelAspect);
-      const y = Math.floor((mouseY - transform.y) / transform.scale);
-      if (x < 0 || y < 0 || x >= source.width || y >= source.height) {
+      const point = screenToImage(mouseX, mouseY, transform, pixelAspect, source);
+      if (!point) {
         setPixelSample(null);
         return;
       }
-      setPixelSample(sampleFloatPixel(gpuFrame, x, y));
+      setPixelSample(sampleFloatPixel(gpuFrame, Math.floor(point.x), Math.floor(point.y)));
     },
     [activeSource, gpuFrame, pixelAspect, transform],
   );
@@ -309,8 +329,8 @@ export function ViewerPanel({
     ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
     ctx.clearRect(0, 0, rect.width, rect.height);
 
-    const displayWidth = activeSource.width * pixelAspect;
-    const displayHeight = activeSource.height;
+    const displayWidth = activeDisplaySize?.width ?? 0;
+    const displayHeight = activeDisplaySize?.height ?? 0;
     const gpuCanvas = gpuCanvasRef.current;
     const bitmapCanvas = bitmapCanvasRef.current;
     if (gpuFrame && gpuCanvas) {
@@ -349,7 +369,7 @@ export function ViewerPanel({
         const message = error instanceof Error ? error.message : String(error);
         webglRendererRef.current?.dispose();
         webglRendererRef.current = null;
-        const recoveryKey = gpuRenderKey(gpuFrame, gpuCompareFrame);
+        const recoveryKey = viewerFrameRenderKey(gpuFrame, gpuCompareFrame);
         const currentRecovery =
           gpuRecoveryRef.current.key === recoveryKey ? gpuRecoveryRef.current : { key: recoveryKey, attempts: 0 };
         if (currentRecovery.attempts < 2) {
@@ -423,13 +443,15 @@ export function ViewerPanel({
     if (showBbox && metadata) {
       drawBboxOverlay(ctx, metadata, activeSource, transform, pixelAspect);
     }
+    drawRoiOverlay(ctx, draftRoi ?? viewerRoi, transform, pixelAspect, viewerTool === "roi");
     drawDraftGeometry(ctx, draftPoints, transform, pixelAspect);
     drawResolutionBadge(ctx, `${activeSource.width}x${activeSource.height}`, transform, displayWidth, displayHeight, rect.width, rect.height);
   }, [
     activeSource,
+    activeDisplaySize,
     compareEnabled,
-    compareImageSize,
     compareMode,
+    draftRoi,
     draftPoints,
     gpuCompareFrame,
     gpuFrame,
@@ -442,6 +464,8 @@ export function ViewerPanel({
     viewerFstop,
     viewerGain,
     viewerSaturation,
+    viewerRoi,
+    viewerTool,
     wipeAngle,
     wipePosition,
   ]);
@@ -473,19 +497,19 @@ export function ViewerPanel({
 
   useEffect(() => {
     if (!gpuFrame) return;
-    const formatKey = `${gpuFrame.header.width}x${gpuFrame.header.height}@${pixelAspect}`;
+    const formatKey = viewerFrameFormatKey(gpuFrame, pixelAspect);
     const shouldFit = imageFormatRef.current !== formatKey;
     imageFormatRef.current = formatKey;
     setImageSize((current) =>
-      current.width === gpuFrame.header.width && current.height === gpuFrame.header.height
+      current.width === frameSize?.width && current.height === frameSize?.height
         ? current
-        : { width: gpuFrame.header.width, height: gpuFrame.header.height },
+        : { width: frameSize?.width ?? current.width, height: frameSize?.height ?? current.height },
     );
     if (shouldFit) {
       pendingFitRef.current = true;
       window.requestAnimationFrame(() => fitImage());
     }
-  }, [fitImage, gpuFrame, pixelAspect]);
+  }, [fitImage, frameSize, gpuFrame, pixelAspect]);
 
   useEffect(() => {
     setPixelSample(null);
@@ -494,13 +518,11 @@ export function ViewerPanel({
   useEffect(() => {
     if (!compareImageUrl) {
       compareImageRef.current = null;
-      setCompareImageSize({ width: 0, height: 0 });
       return;
     }
     const image = new Image();
     image.onload = () => {
       compareImageRef.current = image;
-      setCompareImageSize({ width: image.naturalWidth, height: image.naturalHeight });
       setBitmapRevision((revision) => revision + 1);
     };
     image.src = compareImageUrl;
@@ -632,6 +654,15 @@ export function ViewerPanel({
           </button>
         </div>
         <div className="viewer-proxy-controls">
+          <div className="viewer-profile-controls">
+            <button className={viewerProfilePreset === "speed" ? "active" : ""} onClick={() => onApplyViewerProfile("speed")}>
+              Speed
+            </button>
+            <button className={viewerProfilePreset === "quality" ? "active" : ""} onClick={() => onApplyViewerProfile("quality")}>
+              Quality
+            </button>
+            <span>{viewerProfilePreset === "custom" ? "Custom" : viewerProfilePreset === "speed" ? "1280x720 proxy" : "Full res"}</span>
+          </div>
           <label className="toggle-label compact-toggle">
             <input
               type="checkbox"
@@ -685,6 +716,12 @@ export function ViewerPanel({
           </button>
           <button className={viewerTool === "spline" ? "active" : ""} onClick={() => onViewerToolChange("spline")}>
             Spline
+          </button>
+          <button className={viewerTool === "roi" || viewerRoi ? "active" : ""} onClick={() => onViewerToolChange("roi")}>
+            ROI
+          </button>
+          <button disabled={!viewerRoi} onClick={() => onViewerRoiChange(null)}>
+            Clear ROI
           </button>
           <button className={showBbox ? "active" : ""} onClick={() => setShowBbox((value) => !value)}>
             BBox
@@ -829,6 +866,23 @@ export function ViewerPanel({
             const mouseX = event.clientX - rect.left;
             const mouseY = event.clientY - rect.top;
             updatePixelSample(mouseX, mouseY);
+            if (viewerTool === "roi" && activeSource) {
+              const point = screenToImage(mouseX, mouseY, transform, pixelAspect, activeSource);
+              if (!point) return;
+              const hit = roiHitTest(mouseX, mouseY, viewerRoi, transform, pixelAspect);
+              roiDragRef.current = {
+                mode: hit?.mode ?? "draw",
+                startPoint: point,
+                startRoi: viewerRoi,
+              };
+              if (!hit) {
+                const nextRoi = normalizeViewerRoi(point, point, activeSource);
+                setDraftRoi(nextRoi);
+                onViewerRoiChange(nextRoi);
+              }
+              event.currentTarget.setPointerCapture(event.pointerId);
+              return;
+            }
             if (
               compareEnabled &&
               compareMode === "wipe" &&
@@ -863,6 +917,14 @@ export function ViewerPanel({
             const mouseX = event.clientX - rect.left;
             const mouseY = event.clientY - rect.top;
             updatePixelSample(mouseX, mouseY);
+            if (roiDragRef.current && activeSource) {
+              const point = screenToImage(mouseX, mouseY, transform, pixelAspect, activeSource);
+              if (!point) return;
+              const nextRoi = updateViewerRoiFromDrag(roiDragRef.current, point, activeSource);
+              setDraftRoi(nextRoi);
+              onViewerRoiChange(nextRoi);
+              return;
+            }
             if (wipeDragRef.current && activeSource) {
               onWipePositionChange(wipePositionFromPointer(mouseX, transform, activeSource, pixelAspect));
               return;
@@ -880,6 +942,8 @@ export function ViewerPanel({
           onPointerUp={(event) => {
             dragRef.current = null;
             wipeDragRef.current = false;
+            roiDragRef.current = null;
+            setDraftRoi(null);
             if (event.currentTarget.hasPointerCapture(event.pointerId)) {
               event.currentTarget.releasePointerCapture(event.pointerId);
             }
@@ -916,7 +980,8 @@ export function ViewerPanel({
         >
           {cacheHudCollapsed ? cacheHudText : cacheStatus}
         </button>
-        {!imageUrl && !gpuFrame && <div className="empty-viewer">No frame</div>}
+        {!imageUrl && !gpuFrame && !renderError && <div className="empty-viewer">No frame</div>}
+        {renderError && <div className="viewer-error-overlay">{renderError}</div>}
         {activeSource && (
           <button
             type="button"
@@ -954,8 +1019,11 @@ export function ViewerPanel({
           cachedFrames={cachedFrames}
           onFrameChange={onFrameChange}
         />
-        <div className={isRendering || renderStatus ? "render-state active" : "render-state"}>
-          {renderStatus ?? (isRendering ? "rendering" : "ready")}
+        <div
+          className={renderError ? "render-state error" : isRendering || renderStatus ? "render-state active" : "render-state"}
+          title={renderError ?? undefined}
+        >
+          {renderError ? "Error" : renderStatus ?? (isRendering ? "rendering" : "ready")}
         </div>
       </div>
     </section>
@@ -1115,85 +1183,6 @@ function FrameRulerSlider({ frame, frameStart, frameEnd, cachedFrames, onFrameCh
   );
 }
 
-function compactCacheStatus(status: string) {
-  const match = status.match(/^cache:\s*([^|]+)/i);
-  return match ? `cache ${match[1].trim()}` : "cache";
-}
-
-function drawCheckerboard(ctx: CanvasRenderingContext2D, width: number, height: number) {
-  const size = 16;
-  for (let y = 0; y < height; y += size) {
-    for (let x = 0; x < width; x += size) {
-      const light = (x / size + y / size) % 2 === 0;
-      ctx.fillStyle = light ? "#161616" : "#101010";
-      ctx.fillRect(x, y, size, size);
-    }
-  }
-}
-
-function drawResolutionBadge(
-  ctx: CanvasRenderingContext2D,
-  label: string,
-  transform: ViewerTransform,
-  displayWidth: number,
-  displayHeight: number,
-  canvasWidth: number,
-  canvasHeight: number,
-) {
-  const imageRight = transform.x + displayWidth * transform.scale;
-  const imageBottom = transform.y + displayHeight * transform.scale;
-  if (imageRight < 0 || imageBottom < 0 || transform.x > canvasWidth || transform.y > canvasHeight) return;
-
-  ctx.save();
-  ctx.font = '10px ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace';
-  ctx.textBaseline = "middle";
-  const width = Math.ceil(ctx.measureText(label).width) + 9;
-  const height = 14;
-  const outsideX = imageRight + 4;
-  const insideX = imageRight - width - 4;
-  const x = outsideX + width <= canvasWidth - 4 ? outsideX : insideX;
-  const y = imageBottom + 2 + height <= canvasHeight - 4 ? imageBottom + 2 : imageBottom - height - 4;
-  const clampedX = clamp(x, 4, Math.max(4, canvasWidth - width - 4));
-  const clampedY = clamp(y, 4, Math.max(4, canvasHeight - height - 4));
-
-  ctx.fillStyle = "rgba(12, 12, 12, 0.72)";
-  ctx.strokeStyle = "#8a8a8a";
-  ctx.lineWidth = 1;
-  ctx.fillRect(clampedX, clampedY, width, height);
-  ctx.strokeRect(clampedX + 0.5, clampedY + 0.5, width - 1, height - 1);
-  ctx.fillStyle = "#d6d6d6";
-  ctx.fillText(label, clampedX + 5, clampedY + height / 2 + 0.5);
-  ctx.restore();
-}
-
-function resizeCanvas(canvas: HTMLCanvasElement, rect: DOMRect, ratio: number) {
-  const width = Math.max(1, Math.round(rect.width * ratio));
-  const height = Math.max(1, Math.round(rect.height * ratio));
-  if (canvas.width !== width) canvas.width = width;
-  if (canvas.height !== height) canvas.height = height;
-}
-
-function gpuRenderKey(frameA: FloatViewerFrame, frameB: FloatViewerFrame | null) {
-  const a = frameA.header;
-  const b = frameB?.header;
-  return [
-    a.node_id,
-    a.viewer_input ?? "",
-    a.frame,
-    a.channel,
-    a.dtype,
-    `${a.width}x${a.height}`,
-    a.byte_length,
-    b?.node_id ?? "",
-    b?.viewer_input ?? "",
-    b?.frame ?? "",
-    b?.channel ?? "",
-    b?.dtype ?? "",
-    b ? `${b.width}x${b.height}` : "",
-    b?.byte_length ?? "",
-  ].join("|");
-}
-
 function PixelReadout({ sample }: { sample: PixelSample }) {
   return (
     <div className="pixel-readout">
@@ -1213,195 +1202,6 @@ function PixelReadout({ sample }: { sample: PixelSample }) {
   );
 }
 
-function sampleFloatPixel(frame: FloatViewerFrame, x: number, y: number): PixelSample | null {
-  const { width, height, source_width: sourceWidth, source_height: sourceHeight } = frame.header;
-  if (x < 0 || y < 0 || x >= width || y >= height) return null;
-  const rgba = sampleFrameRgba(frame, y * width + x);
-  if (!rgba) return null;
-  const [r, g, b, a] = rgba.map(finitePixelValue) as [number, number, number, number];
-  return {
-    x: mapProxyCoordinateToSource(x, width, sourceWidth),
-    y: mapProxyCoordinateToSource(y, height, sourceHeight),
-    rgba: [r, g, b, a],
-    swatch: linearRgbToCss([r, g, b]),
-    hsv: rgbToHsv(r, g, b),
-    luma: r * 0.2126 + g * 0.7152 + b * 0.0722,
-  };
-}
-
-function sampleFrameRgba(frame: FloatViewerFrame, pixelIndex: number): [number, number, number, number] | null {
-  if (frame.header.dtype === "rgb10a2") {
-    if (pixelIndex >= frame.pixels.length) return null;
-    const packed = frame.pixels[pixelIndex] ?? 0;
-    return [
-      (packed & 0x3ff) / 1023,
-      ((packed >>> 10) & 0x3ff) / 1023,
-      ((packed >>> 20) & 0x3ff) / 1023,
-      ((packed >>> 30) & 0x03) / 3,
-    ];
-  }
-  const index = pixelIndex * 4;
-  if (index + 3 >= frame.pixels.length) return null;
-  if (frame.header.dtype === "float16") {
-    return [
-      halfToFloat(frame.pixels[index]),
-      halfToFloat(frame.pixels[index + 1]),
-      halfToFloat(frame.pixels[index + 2]),
-      halfToFloat(frame.pixels[index + 3]),
-    ];
-  }
-  if (frame.header.dtype === "uint8") {
-    return [
-      frame.pixels[index] / 255,
-      frame.pixels[index + 1] / 255,
-      frame.pixels[index + 2] / 255,
-      frame.pixels[index + 3] / 255,
-    ];
-  }
-  return [frame.pixels[index], frame.pixels[index + 1], frame.pixels[index + 2], frame.pixels[index + 3]];
-}
-
-function halfToFloat(value: number) {
-  const sign = (value & 0x8000) ? -1 : 1;
-  const exponent = (value >> 10) & 0x1f;
-  const fraction = value & 0x03ff;
-  if (exponent === 0) {
-    return sign * 2 ** -14 * (fraction / 1024);
-  }
-  if (exponent === 0x1f) {
-    return fraction ? 0 : sign * Infinity;
-  }
-  return sign * 2 ** (exponent - 15) * (1 + fraction / 1024);
-}
-
-function mapProxyCoordinateToSource(value: number, proxySize: number, sourceSize: number) {
-  const targetSize = Math.max(1, sourceSize || proxySize);
-  if (proxySize <= 1) return 0;
-  return clamp(Math.round(((value + 0.5) * targetSize) / proxySize - 0.5), 0, targetSize - 1);
-}
-
-function finitePixelValue(value: number) {
-  return Number.isFinite(value) ? value : 0;
-}
-
-function linearRgbToCss(rgb: [number, number, number]) {
-  const channels = rgb.map((value) => Math.round(linearToSrgb(clamp(value, 0, 1)) * 255));
-  return `rgb(${channels[0]} ${channels[1]} ${channels[2]})`;
-}
-
-function linearToSrgb(value: number) {
-  return value <= 0.0031308 ? value * 12.92 : 1.055 * value ** (1 / 2.4) - 0.055;
-}
-
-function rgbToHsv(r: number, g: number, b: number) {
-  const max = Math.max(r, g, b);
-  const min = Math.min(r, g, b);
-  const delta = max - min;
-  let h = 0;
-  if (delta > 1e-8) {
-    if (max === r) h = ((g - b) / delta) % 6;
-    else if (max === g) h = (b - r) / delta + 2;
-    else h = (r - g) / delta + 4;
-    h *= 60;
-    if (h < 0) h += 360;
-  }
-  return {
-    h,
-    s: Math.abs(max) > 1e-8 ? delta / Math.abs(max) : 0,
-    v: max,
-  };
-}
-
-function formatPixelValue(value: number) {
-  return Number.isFinite(value) ? value.toFixed(5) : "0.00000";
-}
-
-function formatCompactValue(value: number) {
-  if (!Number.isFinite(value)) return "0";
-  if (Math.abs(value) >= 100) return value.toFixed(0);
-  if (Math.abs(value) >= 10) return value.toFixed(1);
-  return value.toFixed(2);
-}
-
-function drawViewerImage(
-  ctx: CanvasRenderingContext2D,
-  image: HTMLImageElement,
-  transform: ViewerTransform,
-  displayWidth: number,
-  displayHeight: number,
-) {
-  ctx.drawImage(image, transform.x, transform.y, displayWidth * transform.scale, displayHeight * transform.scale);
-}
-
-function drawWipeImage(
-  ctx: CanvasRenderingContext2D,
-  image: HTMLImageElement,
-  transform: ViewerTransform,
-  displayWidth: number,
-  displayHeight: number,
-  position: number,
-  angle: number,
-  canvasExtent: number,
-) {
-  const width = displayWidth * transform.scale;
-  const height = displayHeight * transform.scale;
-  const pointX = transform.x + width * position;
-  const pointY = transform.y + height * 0.5;
-  const angleRad = (angle * Math.PI) / 180;
-  const normalX = Math.cos(angleRad);
-  const normalY = Math.sin(angleRad);
-  const tangentX = -normalY;
-  const tangentY = normalX;
-  const far = Math.max(width, height, canvasExtent) * 3;
-
-  ctx.save();
-  ctx.beginPath();
-  ctx.moveTo(pointX + tangentX * far, pointY + tangentY * far);
-  ctx.lineTo(pointX - tangentX * far, pointY - tangentY * far);
-  ctx.lineTo(pointX - tangentX * far + normalX * far, pointY - tangentY * far + normalY * far);
-  ctx.lineTo(pointX + tangentX * far + normalX * far, pointY + tangentY * far + normalY * far);
-  ctx.closePath();
-  ctx.clip();
-  drawViewerImage(ctx, image, transform, displayWidth, displayHeight);
-  ctx.restore();
-
-  ctx.save();
-  ctx.strokeStyle = "#f29b18";
-  ctx.lineWidth = 1.5;
-  ctx.beginPath();
-  ctx.moveTo(pointX - tangentX * far, pointY - tangentY * far);
-  ctx.lineTo(pointX + tangentX * far, pointY + tangentY * far);
-  ctx.stroke();
-  ctx.restore();
-}
-
-function drawWipeGuide(
-  ctx: CanvasRenderingContext2D,
-  transform: ViewerTransform,
-  displayWidth: number,
-  displayHeight: number,
-  position: number,
-  angle: number,
-  canvasExtent: number,
-) {
-  const width = displayWidth * transform.scale;
-  const height = displayHeight * transform.scale;
-  const pointX = transform.x + width * position;
-  const pointY = transform.y + height * 0.5;
-  const angleRad = (angle * Math.PI) / 180;
-  const tangentX = -Math.sin(angleRad);
-  const tangentY = Math.cos(angleRad);
-  const far = Math.max(width, height, canvasExtent) * 3;
-  ctx.save();
-  ctx.strokeStyle = "#f29b18";
-  ctx.lineWidth = 1.5;
-  ctx.beginPath();
-  ctx.moveTo(pointX - tangentX * far, pointY - tangentY * far);
-  ctx.lineTo(pointX + tangentX * far, pointY + tangentY * far);
-  ctx.stroke();
-  ctx.restore();
-}
-
 function drawBboxOverlay(
   ctx: CanvasRenderingContext2D,
   metadata: NodeMetadata,
@@ -1409,8 +1209,8 @@ function drawBboxOverlay(
   transform: ViewerTransform,
   pixelAspect: number,
 ) {
-  const formatBox = metadata.format_bbox ?? { x: 0, y: 0, width: metadata.width, height: metadata.height };
-  const dataWindow = metadata.data_window ?? formatBox;
+  const formatBox = nodeMetadataFormatBox(metadata);
+  const dataWindow = nodeMetadataDataWindow(metadata);
   drawSourceBox(ctx, formatBox, metadata, source, transform, pixelAspect, "#6f6f6f", []);
   if (!sameBox(formatBox, dataWindow)) {
     drawSourceBox(ctx, dataWindow, metadata, source, transform, pixelAspect, "#f29b18", [5, 4]);
@@ -1428,12 +1228,11 @@ function drawSourceBox(
   color: string,
   dash: number[],
 ) {
-  const sx = source.width / Math.max(metadata.width, 1);
-  const sy = source.height / Math.max(metadata.height, 1);
-  const x = transform.x + box.x * sx * pixelAspect * transform.scale;
-  const y = transform.y + box.y * sy * transform.scale;
-  const width = box.width * sx * pixelAspect * transform.scale;
-  const height = box.height * sy * transform.scale;
+  const scale = nodeMetadataScale(metadata, source);
+  const x = transform.x + box.x * scale.x * pixelAspect * transform.scale;
+  const y = transform.y + box.y * scale.y * transform.scale;
+  const width = box.width * scale.x * pixelAspect * transform.scale;
+  const height = box.height * scale.y * transform.scale;
   ctx.save();
   ctx.strokeStyle = color;
   ctx.lineWidth = 1;
@@ -1451,17 +1250,16 @@ function drawBboxStrip(
   transform: ViewerTransform,
   pixelAspect: number,
 ) {
-  const sx = source.width / Math.max(metadata.width, 1);
-  const sy = source.height / Math.max(metadata.height, 1);
+  const scale = nodeMetadataScale(metadata, source);
   const stripY = transform.y + source.height * transform.scale + 7;
-  const formatX0 = transform.x + formatBox.x * sx * pixelAspect * transform.scale;
-  const formatX1 = formatX0 + formatBox.width * sx * pixelAspect * transform.scale;
-  const dataX0 = transform.x + dataWindow.x * sx * pixelAspect * transform.scale;
-  const dataX1 = dataX0 + dataWindow.width * sx * pixelAspect * transform.scale;
-  const formatY0 = transform.y + formatBox.y * sy * transform.scale;
-  const formatY1 = formatY0 + formatBox.height * sy * transform.scale;
-  const dataY0 = transform.y + dataWindow.y * sy * transform.scale;
-  const dataY1 = dataY0 + dataWindow.height * sy * transform.scale;
+  const formatX0 = transform.x + formatBox.x * scale.x * pixelAspect * transform.scale;
+  const formatX1 = formatX0 + formatBox.width * scale.x * pixelAspect * transform.scale;
+  const dataX0 = transform.x + dataWindow.x * scale.x * pixelAspect * transform.scale;
+  const dataX1 = dataX0 + dataWindow.width * scale.x * pixelAspect * transform.scale;
+  const formatY0 = transform.y + formatBox.y * scale.y * transform.scale;
+  const formatY1 = formatY0 + formatBox.height * scale.y * transform.scale;
+  const dataY0 = transform.y + dataWindow.y * scale.y * transform.scale;
+  const dataY1 = dataY0 + dataWindow.height * scale.y * transform.scale;
 
   ctx.save();
   ctx.lineCap = "round";
@@ -1497,75 +1295,49 @@ function sameBox(
   return a.x === b.x && a.y === b.y && a.width === b.width && a.height === b.height;
 }
 
-function screenToImage(
-  mouseX: number,
-  mouseY: number,
-  transform: ViewerTransform,
-  pixelAspect: number,
-  imageSize: { width: number; height: number },
-): DraftPoint | null {
-  if (imageSize.width <= 0 || imageSize.height <= 0) return null;
-  const x = (mouseX - transform.x) / transform.scale / pixelAspect;
-  const y = (mouseY - transform.y) / transform.scale;
-  if (x < 0 || y < 0 || x >= imageSize.width || y >= imageSize.height) return null;
-  return { x, y };
-}
-
-function isNearWipeLine(
-  mouseX: number,
-  mouseY: number,
-  transform: ViewerTransform,
-  source: SourceSize,
-  pixelAspect: number,
-  position: number,
-  angle: number,
-) {
-  const width = source.width * pixelAspect * transform.scale;
-  const height = source.height * transform.scale;
-  const pointX = transform.x + width * clamp(position, 0, 1);
-  const pointY = transform.y + height * 0.5;
-  const angleRad = (angle * Math.PI) / 180;
-  const normalX = Math.cos(angleRad);
-  const normalY = Math.sin(angleRad);
-  const distance = Math.abs((mouseX - pointX) * normalX + (mouseY - pointY) * normalY);
-  return distance <= 10;
-}
-
-function wipePositionFromPointer(mouseX: number, transform: ViewerTransform, source: SourceSize, pixelAspect: number) {
-  const width = source.width * pixelAspect * transform.scale;
-  return clamp((mouseX - transform.x) / Math.max(width, 1), 0, 1);
-}
-
-function drawDraftGeometry(
+function drawRoiOverlay(
   ctx: CanvasRenderingContext2D,
-  points: DraftPoint[],
+  roi: ViewerRoi | null,
   transform: ViewerTransform,
   pixelAspect: number,
+  highlighted: boolean,
 ) {
-  if (points.length === 0) return;
+  if (!roi) return;
+  const x = transform.x + roi.x * pixelAspect * transform.scale;
+  const y = transform.y + roi.y * transform.scale;
+  const width = roi.width * pixelAspect * transform.scale;
+  const height = roi.height * transform.scale;
+  const handle = 6;
   ctx.save();
-  ctx.strokeStyle = "#77c8b4";
-  ctx.fillStyle = "#ffd15c";
-  ctx.lineWidth = 1.5;
-  ctx.beginPath();
-  points.forEach((point, index) => {
-    const x = transform.x + point.x * pixelAspect * transform.scale;
-    const y = transform.y + point.y * transform.scale;
-    if (index === 0) ctx.moveTo(x, y);
-    else ctx.lineTo(x, y);
-  });
-  if (points.length > 1) ctx.stroke();
-  for (const point of points) {
-    const x = transform.x + point.x * pixelAspect * transform.scale;
-    const y = transform.y + point.y * transform.scale;
-    ctx.beginPath();
-    ctx.arc(x, y, 4, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.stroke();
+  ctx.fillStyle = highlighted ? "rgba(71, 191, 123, 0.16)" : "rgba(71, 191, 123, 0.1)";
+  ctx.strokeStyle = highlighted ? "#8ef2b0" : "#47bf7b";
+  ctx.lineWidth = highlighted ? 2 : 1.5;
+  ctx.setLineDash([6, 4]);
+  ctx.fillRect(x, y, width, height);
+  ctx.strokeRect(x, y, width, height);
+  ctx.setLineDash([]);
+  ctx.fillStyle = "#d9ffe6";
+  for (const [hx, hy] of roiHandlePositions(x, y, width, height)) {
+    ctx.fillRect(hx - handle / 2, hy - handle / 2, handle, handle);
+    ctx.strokeRect(hx - handle / 2, hy - handle / 2, handle, handle);
   }
+  ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
+  ctx.fillStyle = "#d9ffe6";
+  ctx.fillText(`ROI ${roi.width}x${roi.height} @ ${roi.x},${roi.y}`, x + 8, Math.max(14, y - 8));
   ctx.restore();
 }
 
-function clamp(value: number, min: number, max: number) {
-  return Math.max(min, Math.min(max, value));
+function roiHandlePositions(x: number, y: number, width: number, height: number) {
+  const xMid = x + width * 0.5;
+  const yMid = y + height * 0.5;
+  return [
+    [x, y],
+    [xMid, y],
+    [x + width, y],
+    [x, yMid],
+    [x + width, yMid],
+    [x, y + height],
+    [xMid, y + height],
+    [x + width, y + height],
+  ] as const;
 }
